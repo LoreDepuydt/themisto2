@@ -24,7 +24,7 @@ Themisto 2 currently supports up to 2^32 colors and up to 2^40 k-mers.
 First, install Rust and the Cargo package manager using rustup (no root privileges required): [https://rust-lang.org/tools/install/](https://rust-lang.org/tools/install/). Then, clone this repository and compile with: 
 
 ```
-git clone --recursive https://github.com/jnalanko/themisto2`
+git clone --recursive https://github.com/jnalanko/themisto2
 cd themisto2
 cargo build --release
 ```
