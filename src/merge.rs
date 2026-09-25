@@ -331,6 +331,76 @@ mod tests {
         (colex_to_id, distinct_css_1)
     }
 
+    fn seqs_to_dbs(seqs: &[Vec<u8>]) -> Vec<SeqDB> {
+        seqs.iter().map(|seq| {
+            let mut db = SeqDB::new();
+            db.push_seq(seq);
+            db
+        }).collect()
+    }
+
+    fn build_sbwt(k: usize, seqs: &[Vec<u8>]) -> (SbwtIndex<SubsetMatrix>, LcsArray) {
+        let (mut sbwt, lcs) = sbwt::SbwtIndexBuilder::new()
+            .add_rev_comp(false)
+            .k(k)
+            .build_lcs(true)
+            .n_threads(3)
+            .precalc_length(5)
+            .algorithm(BitPackedKmerSortingMem::new().dedup_batches(true))
+        .run_from_vecs(seqs);
+        sbwt.build_select();
+        (sbwt, lcs.unwrap())
+    }
+
+    /// Builds a CompactColexKmers where color i consists of the single sequence seqs[i].
+    fn build_coloring(k: usize, seqs: &[Vec<u8>], sample_distance: usize, n_threads: usize) -> CompactColexKmers<SparseDenseStorage> {
+        let (sbwt, lcs) = build_sbwt(k, seqs);
+        let (colex_to_id, storage) = build_color_sets::<SparseDenseStorage>(&sbwt, &lcs, seqs_to_dbs(seqs), n_threads);
+
+        let mut gen: Box<dyn RewindableSeqStreamGenerator + Sync + Send> = Box::new(VecVecRewindableGen::new(seqs.to_vec()));
+        let key_kmers = mark_key_kmers(&sbwt, &lcs, sample_distance, &mut gen, n_threads, 1, false);
+        let sampled_ids: Vec<usize> = colex_to_id.iter().enumerate().filter(|(i, _)| key_kmers[*i]).map(|(_,x)| *x).collect();
+        assert!(key_kmers.count_ones() == sampled_ids.len());
+
+        let mut key_kmers = crate::util::bitvec_to_simple_sds_bitvec(key_kmers);
+        key_kmers.enable_rank();
+
+        let colex_map = ColexToColorSetMap{
+            sampling: key_kmers,
+            color_set_ids: CompactIntVec::from_vec(sampled_ids),
+        };
+
+        CompactColexKmers::new(sbwt, lcs, colex_map, storage, None)
+    }
+
+    /// Merges the colorings of input_seqs_1 and input_seqs_2 (one color per sequence) and checks
+    /// that every k-mer gets the same color set as in a coloring built directly from all sequences.
+    fn check_merge(k: usize, input_seqs_1: &[Vec<u8>], input_seqs_2: &[Vec<u8>], input_sample_distance: usize, merge_sample_distance: usize, n_threads: usize) {
+        let mut all_input_seqs = input_seqs_1.to_vec();
+        all_input_seqs.extend(input_seqs_2.iter().cloned());
+
+        let ccc1 = build_coloring(k, input_seqs_1, input_sample_distance, n_threads);
+        let ccc2 = build_coloring(k, input_seqs_2, input_sample_distance, n_threads);
+        let ccc_both = build_coloring(k, &all_input_seqs, input_sample_distance, n_threads);
+
+        let ccc_merged = super::merge_compact_colex_kmers(ccc1, ccc2, true, merge_sample_distance, n_threads);
+        let sbwt_merged = &ccc_merged.sbwt();
+
+        for colex in 0..ccc_both.sbwt().n_sets() {
+            let kmer = ccc_both.sbwt().access_kmer(colex);
+
+            if kmer.iter().all(|c| *c != b'$') { // Not a dummy k-mer
+                let true_colors: Vec<usize> = ccc_both.colex_to_set(colex).iter().collect();
+                let range = sbwt_merged.search(&kmer).unwrap();
+                assert_eq!(range.len(), 1);
+                let colex_merged = range.start;
+                let merged_colors: Vec<usize> = ccc_merged.colex_to_set(colex_merged).iter().collect();
+
+                assert_eq!(true_colors, merged_colors, "k = {}, k-mer {}", k, String::from_utf8_lossy(&kmer));
+            }
+        }
+    }
+
     #[test]
     fn test_merge() {
 
@@ -344,134 +414,75 @@ mod tests {
             let input_seqs_1: Vec<Vec<u8>> = (0..10).map(|i| gen_random_dna_string(20, (i + k.pow(4)) as u64)).collect();
             let input_seqs_2: Vec<Vec<u8>> = (0..10).map(|i| gen_random_dna_string(20, (123456 + i + k.pow(4)) as u64)).collect();
 
-            let mut all_input_seq_slices = Vec::<&[u8]>::new();
-            all_input_seq_slices.extend(input_seqs_1.iter().map(|s| s.as_slice()));
-            all_input_seq_slices.extend(input_seqs_2.iter().map(|s| s.as_slice()));
+            check_merge(k, &input_seqs_1, &input_seqs_2, 3, 5, n_threads);
+        }
+    }
 
-            let all_input_seqs: Vec<Vec<u8>> = all_input_seq_slices.iter().map(|s| s.to_vec()).collect();
+    // The sample distances in the tests below are larger than any unitig, so that
+    // only the structurally required key k-mers get marked. Any k-mer that the
+    // merge forgets to mark then results in a wrong color set.
+    const NO_SAMPLING: usize = 1000;
 
-            let mut dbs1 = Vec::<SeqDB>::new();
-            let mut dbs2 = Vec::<SeqDB>::new();
-            let mut dbs_both = Vec::<SeqDB>::new();
-            for seq in input_seqs_1.iter() {
-                let mut db = SeqDB::new();
-                db.push_seq(seq);
-                dbs1.push(db);
+    #[test]
+    fn test_merge_multiple_colored_subunitigs_in_one_unitig() {
+        let _ = env_logger::try_init();
+        let k = 11;
+        let genome = gen_random_dna_string(80, 1);
 
-                let mut db = SeqDB::new();
-                db.push_seq(seq);
-                dbs_both.push(db);
-            }
-            for seq in input_seqs_2.iter() {
-                let mut db = SeqDB::new();
-                db.push_seq(seq);
-                dbs2.push(db);
+        // Color 1 covers the middle of the unitig of color 0, so the single unitig
+        // of the first coloring breaks into three colored subunitigs.
+        let input_seqs_1 = vec![genome.clone(), genome[20..50].to_vec()];
+        let input_seqs_2 = vec![gen_random_dna_string(80, 2)];
 
-                let mut db = SeqDB::new();
-                db.push_seq(seq);
-                dbs_both.push(db);
-            }
+        check_merge(k, &input_seqs_1, &input_seqs_2, NO_SAMPLING, NO_SAMPLING, 3);
+        check_merge(k, &input_seqs_2, &input_seqs_1, NO_SAMPLING, NO_SAMPLING, 3);
+    }
 
-            let (mut sbwt1, lcs1) = sbwt::SbwtIndexBuilder::new()
-                .add_rev_comp(false)
-                .k(k)
-                .build_lcs(true)
-                .n_threads(3)
-                .precalc_length(5)
-                .algorithm(BitPackedKmerSortingMem::new().dedup_batches(true))
-            .run_from_vecs(&input_seqs_1);
+    #[test]
+    fn test_merge_shared_kmers_in_middle_of_unitig() {
+        let _ = env_logger::try_init();
+        let k = 11;
+        let genome = gen_random_dna_string(80, 3);
 
-            let (mut sbwt2, lcs2) = sbwt::SbwtIndexBuilder::new()
-                .add_rev_comp(false)
-                .k(k)
-                .build_lcs(true)
-                .n_threads(3)
-                .precalc_length(5)
-                .algorithm(BitPackedKmerSortingMem::new().dedup_batches(true))
-            .run_from_vecs(&input_seqs_2);
+        // The k-mers of the first coloring form a run in the middle of the unitig
+        // of the second coloring, so processing the second coloring enters and
+        // leaves a run of previously visited k-mers.
+        let inner = vec![genome[20..50].to_vec()];
+        let outer = vec![genome.clone()];
+        check_merge(k, &inner, &outer, NO_SAMPLING, NO_SAMPLING, 3);
+        check_merge(k, &outer, &inner, NO_SAMPLING, NO_SAMPLING, 3);
 
-            let (mut sbwt_both, lcs_both) = sbwt::SbwtIndexBuilder::new()
-                .add_rev_comp(false)
-                .k(k)
-                .build_lcs(true)
-                .n_threads(3)
-                .precalc_length(5)
-                .algorithm(BitPackedKmerSortingMem::new().dedup_batches(true))
-            .run_from_slices(&all_input_seq_slices);
+        // Partial overlap: a shared run at the start of one unitig and at the end of the other.
+        let left = vec![genome[0..50].to_vec()];
+        let right = vec![genome[30..80].to_vec()];
+        check_merge(k, &left, &right, NO_SAMPLING, NO_SAMPLING, 3);
+        check_merge(k, &right, &left, NO_SAMPLING, NO_SAMPLING, 3);
+    }
 
-            sbwt1.build_select();
-            sbwt2.build_select();
-            sbwt_both.build_select();
+    #[test]
+    fn test_merge_overlapping_random_substrings() {
+        use rand_chacha::rand_core::{RngCore, SeedableRng};
 
-            let lcs1 = lcs1.unwrap();
-            let lcs2 = lcs2.unwrap();
-            let lcs_both = lcs_both.unwrap();
+        let _ = env_logger::try_init();
+        let n_threads = 3;
 
-
-            let sample_distance = 3;
-            //let sample_distance = 1;
-
-            let (colex_to_id_1, storage_1) = build_color_sets::<SparseDenseStorage>(&sbwt1, &lcs1, dbs1, n_threads); 
-            let (colex_to_id_2, storage_2) = build_color_sets::<SparseDenseStorage>(&sbwt2, &lcs2, dbs2, n_threads); 
-            let (colex_to_id_both, storage_both)= build_color_sets::<SparseDenseStorage>(&sbwt_both, &lcs_both, dbs_both, n_threads); 
-            
-            let mut gen1: Box<dyn RewindableSeqStreamGenerator + Sync + Send> = Box::new(VecVecRewindableGen::new(input_seqs_1.clone()));
-            let mut gen2: Box<dyn RewindableSeqStreamGenerator + Sync + Send> = Box::new(VecVecRewindableGen::new(input_seqs_2.clone()));
-            let mut gen_both: Box<dyn RewindableSeqStreamGenerator + Sync + Send> = Box::new(VecVecRewindableGen::new(all_input_seqs.clone()));
-            let key_kmers_1 = mark_key_kmers(&sbwt1, &lcs1, sample_distance, &mut gen1, n_threads, 1, false);
-            let key_kmers_2 = mark_key_kmers(&sbwt2, &lcs2, sample_distance, &mut gen2, n_threads, 1, false);
-            let key_kmers_both = mark_key_kmers(&sbwt_both, &lcs_both, sample_distance, &mut gen_both, n_threads, 1, false);
-
-            let sampled_ids_1: Vec<usize> = colex_to_id_1.iter().enumerate().filter(|(i, _)| key_kmers_1[*i]).map(|(_,x)| *x).collect();
-            let sampled_ids_2: Vec<usize> = colex_to_id_2.iter().enumerate().filter(|(i, _)| key_kmers_2[*i]).map(|(_,x)| *x).collect();
-            let sampled_ids_both: Vec<usize> = colex_to_id_both.iter().enumerate().filter(|(i, _)| key_kmers_both[*i]).map(|(_,x)| *x).collect();
-
-            assert!(key_kmers_1.count_ones() == sampled_ids_1.len());
-            let mut key_kmers_1 = crate::util::bitvec_to_simple_sds_bitvec(key_kmers_1);
-            let mut key_kmers_2 = crate::util::bitvec_to_simple_sds_bitvec(key_kmers_2);
-            let mut key_kmers_both = crate::util::bitvec_to_simple_sds_bitvec(key_kmers_both);
-
-            key_kmers_1.enable_rank();
-            key_kmers_2.enable_rank();
-            key_kmers_both.enable_rank();
-
-            let colex_map_1 = ColexToColorSetMap{
-                sampling: key_kmers_1,
-                color_set_ids: CompactIntVec::from_vec(sampled_ids_1),
-            };
-
-            let colex_map_2 = ColexToColorSetMap{
-                sampling: key_kmers_2,
-                color_set_ids: CompactIntVec::from_vec(sampled_ids_2),
-            };
-
-            let colex_map_both = ColexToColorSetMap{
-                sampling: key_kmers_both,
-                color_set_ids: CompactIntVec::from_vec(sampled_ids_both),
-            };
-
-            let ccc1 = CompactColexKmers::new(sbwt1, lcs1, colex_map_1, storage_1, None);
-            let ccc2 = CompactColexKmers::new(sbwt2, lcs2, colex_map_2, storage_2, None);
-            let ccc_both = CompactColexKmers::new(sbwt_both, lcs_both, colex_map_both, storage_both, None);
-
-            let ccc_merged = super::merge_compact_colex_kmers(ccc1, ccc2, true, 5, n_threads);
-            let sbwt_merged = &ccc_merged.sbwt();
-
-            for colex in 0..ccc_both.sbwt().n_sets() {
-                let kmer = ccc_both.sbwt().access_kmer(colex);
-
-                if kmer.iter().all(|c| *c != b'$') { // Not a dummy k-mer
-                    let true_colors: Vec<usize> = ccc_both.colex_to_set(colex).iter().collect();
-                    let range = sbwt_merged.search(&kmer).unwrap();
-                    assert_eq!(range.len(), 1);
-                    let colex_merged = range.start;
-                    //let merged_colors = ccc_merged.colex_to_set(colex_merged).as_bitvec(ccc_both.n_colors);
-                    let merged_colors: Vec<usize> = ccc_merged.colex_to_set(colex_merged).iter().collect();
-
-                    eprintln!("{} {} {:?} {:?} {} {}", colex, String::from_utf8_lossy(&kmer), true_colors, sbwt_merged.search(&kmer), ccc_merged.get_map().sampling.get(colex_merged), ccc_merged.colex_to_set_id(colex_merged));
-                    assert_eq!(true_colors, merged_colors);
-                }
-
+        // Both colorings consist of random substrings of the same genome, so the
+        // colorings share many k-mers and unitigs of the colorings partially overlap
+        // in all kinds of ways.
+        for k in [5_usize, 8, 11, 15] {
+            for (sample_distance, seed) in [(NO_SAMPLING, 0_u64), (3, 1)] {
+                let genome = gen_random_dna_string(300, 1000 + k as u64 + seed);
+                let mut rng = rand_chacha::ChaCha20Rng::seed_from_u64(2000 + k as u64 * 100 + seed);
+                let mut random_substrings = |n: usize| -> Vec<Vec<u8>> {
+                    (0..n).map(|_| {
+                        let start = rng.next_u64() as usize % (genome.len() - k);
+                        let len = k + rng.next_u64() as usize % 80;
+                        genome[start..(start + len).min(genome.len())].to_vec()
+                    }).collect()
+                };
+                let input_seqs_1 = random_substrings(6);
+                let input_seqs_2 = random_substrings(6);
+                check_merge(k, &input_seqs_1, &input_seqs_2, sample_distance, sample_distance, n_threads);
             }
         }
     }
