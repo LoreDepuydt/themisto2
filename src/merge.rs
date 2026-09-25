@@ -35,7 +35,7 @@ fn search_and_mark_in_neighbors<'a>(kmer: &[u8], sbwt: &SbwtIndex<SubsetMatrix>,
     mark_in_neighbors(colex, dbg, marks);
 }
 
-fn mark_key_kmers_for<'a, CSS: ColorSetStorage + Send + Sync>(coloring: &'a CompactColexKmers<CSS>, merged_sbwt: &SbwtIndex<SubsetMatrix>, merged_lcs: &LcsArray, merged_dbg: &Dbg<'_, SubsetMatrix>, key_kmer_marks: &AtomicBitmap, visited_marks: &AtomicBitmap, n_threads: usize) -> Dbg<'a, SubsetMatrix> {
+fn mark_key_kmers_for<'a, CSS: ColorSetStorage + Send + Sync>(coloring: &'a CompactColexKmers<CSS>, merged_sbwt: &SbwtIndex<SubsetMatrix>, merged_lcs: &LcsArray, merged_dbg: &Dbg<'_, SubsetMatrix>, key_kmer_marks: &AtomicBitmap, visited_marks: Option<&AtomicBitmap>, n_threads: usize) -> Dbg<'a, SubsetMatrix> {
 
     let merged_si = StreamingIndex::new(merged_sbwt, merged_lcs);
 
@@ -72,38 +72,35 @@ fn mark_key_kmers_for<'a, CSS: ColorSetStorage + Send + Sync>(coloring: &'a Comp
             search_and_mark_in_neighbors(first_kmer, merged_sbwt, merged_dbg, key_kmer_marks);
         }
 
-        // Mark last k-mer of every run of k-mers that were visited before, and
-        // the in-neighbors of the first k-mer of every run of k-mers that were
-        // visited before.
-        let mut prev_was_visited = false;
-        for (kmer_start, (match_len, colex_range)) in merged_si.matching_statistics_iter(&unitig).skip(k-1).enumerate() {
-            assert!(match_len == k);
-            assert!(colex_range.len() == 1);
+        // Debug-only coverage check: record every k-mer of this unitig as visited, so
+        // mark_new_key_kmers can assert afterwards that every merged k-mer was visited while
+        // processing coloring1 or coloring2. This costs a full streaming-index pass over the
+        // unitig, so it is skipped in release builds. It is otherwise unneeded for marking:
+        // every k-mer that would be marked here is already marked by the loop above or by
+        // mark_new_key_kmers (proof: only the second coloring can have visited k-mers, and
+        // visited = contained in the first coloring. Let x be the first k-mer of a visited run.
+        // - If x is the first k-mer of this unitig, its in-neighbors were marked by the loop above.
+        // - Otherwise its predecessor w in this unitig is not in the first coloring. If x has no
+        //   in-neighbors in the first coloring, x starts a unitig of the first coloring, so the
+        //   loop above marked its in-neighbors when processing the first coloring. Otherwise x
+        //   has an in-neighbor v != w there, so x has in-degree >= 2 in the merged DBG and
+        //   mark_new_key_kmers marked its in-neighbors.
+        // Let x be the last k-mer of a visited run, followed by y in this unitig. y is not in the
+        // first coloring, so either x has out-degree 0 in the first coloring and ends a unitig
+        // there (marked by the loop above), or x has out-degree >= 2 in the merged DBG and ends
+        // a merged unitig (marked by mark_new_key_kmers). Checked with an assertion on ~3700
+        // random adversarial merges.)
+        if let Some(visited_marks) = visited_marks {
+            for (match_len, colex_range) in merged_si.matching_statistics_iter(&unitig).skip(k-1) {
+                assert!(match_len == k);
+                assert!(colex_range.len() == 1);
 
-            let kmer_colex = colex_range.start;
-            let visited = visited_marks.get(kmer_colex);
-            // Visited is true iff the k-mer was visited while processing some earlier coloring.
-
-            if visited & !prev_was_visited {
-                // Start of a new colored subunitig
-                // -> Mark all in-neighbors for sampling
-                // TODO: here we don't have to search again since we get the colex ranks for the MS iterator
-                search_and_mark_in_neighbors(&unitig[kmer_start..kmer_start+k], merged_sbwt, merged_dbg, key_kmer_marks);
-            } else if !visited && prev_was_visited {
-                // One past the end of a colored subunitig
-                // -> mark previous node for sampling
-                // TODO: here we don't have to search again since we get the colex ranks for the MS iterator
-                assert!(kmer_start > 0);
-                search_and_mark_kmer(&unitig[kmer_start-1..kmer_start-1+k], merged_sbwt, key_kmer_marks);
+                // Modifying the same bitmap we are accessing is alright because we are iterating
+                // unitigs and hence this k-mer will not be encountered a second time while
+                // processing this coloring. So in the future if we find a visited-bit that is set
+                // to 1, then it must have been set during the processing of some previous coloring.
+                visited_marks.set(colex_range.start, true);
             }
-            prev_was_visited = visited;
-
-            // Mark this k-mer as visited. Here we are modifying the same bitmap that we are accessing,
-            // but that is alright because we are iterating unitigs and hence this k-mer will not be
-            // encountered a second time while processing this coloring. So in the future if we find
-            // a visited-bit that is set to 1, then it must have been set during the processing of
-            // some previous coloring.
-            visited_marks.set(kmer_colex, true);
         }
         bar.inc(nodes.len() as u64);
     }, n_threads);
@@ -132,12 +129,17 @@ fn mark_new_key_kmers<'a, 'b, CSS: ColorSetStorage + Send + Sync>(coloring1: &'a
     }, n_threads);
     bar.finish();
     
-    // Mark around starts and ends of colored subunitigs
-    let visited_marks = AtomicBitmap::new(merged_sbwt.n_sets());
-    let dbg1 = mark_key_kmers_for(coloring1, merged_sbwt, merged_lcs, merged_dbg, &key_kmer_marks, &visited_marks, n_threads);
-    let dbg2 = mark_key_kmers_for(coloring2, merged_sbwt, merged_lcs, merged_dbg, &key_kmer_marks, &visited_marks, n_threads);
+    // Debug-only sanity check that every merged k-mer gets visited while processing coloring1
+    // or coloring2 (see the coverage check in mark_key_kmers_for). Skipped in release builds:
+    // it costs a full extra streaming-index pass over the merged graph and is not needed for
+    // marking key k-mers, only for catching merge bugs during development.
+    let visited_marks = cfg!(debug_assertions).then(|| AtomicBitmap::new(merged_sbwt.n_sets()));
+    let dbg1 = mark_key_kmers_for(coloring1, merged_sbwt, merged_lcs, merged_dbg, &key_kmer_marks, visited_marks.as_ref(), n_threads);
+    let dbg2 = mark_key_kmers_for(coloring2, merged_sbwt, merged_lcs, merged_dbg, &key_kmer_marks, visited_marks.as_ref(), n_threads);
 
-    assert_eq!(visited_marks.into_bitvec().count_ones(), merged_sbwt.n_kmers());
+    if let Some(visited_marks) = visited_marks {
+        assert_eq!(visited_marks.into_bitvec().count_ones(), merged_sbwt.n_kmers());
+    }
 
     (key_kmer_marks.into_bitvec(), dbg1, dbg2)
 }
