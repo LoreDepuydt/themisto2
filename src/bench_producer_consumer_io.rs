@@ -68,7 +68,7 @@ fn main() {
     let n_colors = input_paths.len();
 
     let gen: Box<dyn RewindableSeqStreamGenerator + Sync + Send> =
-        Box::new(io::SeqStreamGeneratorFromFiles::new(input_paths));
+        Box::new(io::SeqStreamGeneratorFromFiles::new(input_paths.into_iter().map(|p| vec![p]).collect()));
 
     let total_bases = AtomicU64::new(0);
     let total_seqs = AtomicU64::new(0);

@@ -388,15 +388,15 @@ enum BuildMode {
 }
 
 enum ColoredSeqInput {
-    FileColors(Vec<PathBuf>), // One file per color
+    FileColors(Vec<Vec<PathBuf>>), // One group of files per color
     SequenceColors(PathBuf), // One file, containing one sequence per color.
 }
 
 impl ColoredSeqInput {
     fn get_generator(&self) -> Box<dyn RewindableSeqStreamGenerator + Sync + Send> {
         match self {
-            ColoredSeqInput::FileColors(path_bufs) => {
-                Box::new(io::SeqStreamGeneratorFromFiles::new(path_bufs.clone()))
+            ColoredSeqInput::FileColors(file_groups) => {
+                Box::new(io::SeqStreamGeneratorFromFiles::new(file_groups.clone()))
             },
             ColoredSeqInput::SequenceColors(path_buf) => {
                 Box::new(io::SeqStreamGeneratorFromSingleFile::new(path_buf.clone()))
@@ -421,13 +421,7 @@ fn build_coloring<CSS: ColorSetStorage + Send>(sbwt: sbwt::SbwtIndex<SubsetMatri
     }
 
     if let ColoredSeqInput::FileColors(v) = &input_mode {
-        assert!(v.len() == n_colors as usize, "Number of color names does not match the number of input files");
-    }
-
-    let mut all_input_seq_files = Vec::<PathBuf>::new();
-    match &input_mode {
-        ColoredSeqInput::FileColors(v) => all_input_seq_files.extend(v.clone()),
-        ColoredSeqInput::SequenceColors(file) => all_input_seq_files.push(file.clone()),
+        assert!(v.len() == n_colors as usize, "Number of color names does not match the number of input file groups");
     }
 
     log::info!("=== PHASE 1/3: Marking key k-mers ===");
@@ -474,8 +468,8 @@ fn build_coloring<CSS: ColorSetStorage + Send>(sbwt: sbwt::SbwtIndex<SubsetMatri
         },
         BuildMode::ToDisk(out_prefix, n_pieces) => {
             assert!(n_pieces != 0);
-            let input_paths = match &input_mode {
-                ColoredSeqInput::FileColors(path_bufs) => path_bufs,
+            let file_groups = match &input_mode {
+                ColoredSeqInput::FileColors(file_groups) => file_groups,
                 ColoredSeqInput::SequenceColors(_) => {
                     panic!("ToDisk mode with sequence colors is not yet supported");
                     // The issue is that the current code chunks the input files.
@@ -486,7 +480,7 @@ fn build_coloring<CSS: ColorSetStorage + Send>(sbwt: sbwt::SbwtIndex<SubsetMatri
             let chunk_size = (n_colors as usize).div_ceil(n_pieces);
             if from_unitigs {
                 let mut gens = Vec::<(MsElementGenerator, Range::<usize>)>::new();
-                for (chunk_id, chunk) in input_paths.chunks(chunk_size).enumerate() {
+                for (chunk_id, chunk) in file_groups.chunks(chunk_size).enumerate() {
                     let color_id_range = chunk_id*chunk_size .. min((chunk_id+1)*chunk_size, n_colors as usize);
                     let gen = Box::new(io::SeqStreamGeneratorFromFiles::new(chunk.to_owned()));
                     let ms_gen = MsElementGenerator::new(gen, StreamingIndex::new(&sbwt, &lcs), true, n_parser_threads);
@@ -495,7 +489,7 @@ fn build_coloring<CSS: ColorSetStorage + Send>(sbwt: sbwt::SbwtIndex<SubsetMatri
                 set_of_sets_construction::build_color_set_storage_to_disk::<CSS>(repr_kmer_marks, distinct_set_sizes, gens, &out_prefix, n_threads);
             } else {
                 let mut gens = Vec::<(DeduplicatingColorElementGenerator, Range::<usize>)>::new();
-                for (chunk_id, chunk) in input_paths.chunks(chunk_size).enumerate() {
+                for (chunk_id, chunk) in file_groups.chunks(chunk_size).enumerate() {
                     let color_id_range = chunk_id*chunk_size .. min((chunk_id+1)*chunk_size, n_colors as usize);
                     let gen = Box::new(io::SeqStreamGeneratorFromFiles::new(chunk.to_owned()));
                     let ms_gen = DeduplicatingColorElementGenerator::new(&sbwt, &lcs, gen, true);
@@ -1016,7 +1010,8 @@ fn main() -> std::process::ExitCode {
 
                     // Use input paths also as color names
                     let color_names: Vec<String> = input_paths.iter().map(|p| p.clone().into_os_string().into_string().unwrap()).collect();
-                    (ColoredSeqInput::FileColors(input_paths.clone()), input_paths, color_names)
+                    let file_groups = input_paths.iter().map(|p| vec![p.clone()]).collect();
+                    (ColoredSeqInput::FileColors(file_groups), input_paths, color_names)
                 }
                 (None, Some(sequence_colors_file)) => {
                     // Read color names from the sequence file

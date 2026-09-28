@@ -117,47 +117,33 @@ pub trait RewindableSeqStreamGenerator {
 	fn rewind(&mut self);
 }
 
+// Generates one stream per group of files. The files of a group are read one after
+// the other as a single stream.
 pub struct SeqStreamGeneratorFromFiles {
-    files: Vec<PathBuf>,
-    cur_file_idx: usize,
+    file_groups: Vec<Vec<PathBuf>>,
+    cur_group_idx: usize,
 }
 
 impl SeqStreamGeneratorFromFiles {
-    pub fn new(files: Vec<PathBuf>) -> Self {
-        Self {files, cur_file_idx: 0}
-    }
-}
-
-pub struct JSeqIOWrapper { // So that we can implement sbwt::SeqStream for jseqio::reader
-    inner: jseqio::reader::DynamicFastXReader,
-    cur_buf: Vec<u8>,
-}
-
-impl sbwt::SeqStream for JSeqIOWrapper {
-    fn stream_next(&mut self) -> Option<&[u8]> {
-        let maybe_rec = self.inner.read_next().unwrap(); // Unwrap the IO Result
-        let rec = maybe_rec?; // If None -> end of stream
-        self.cur_buf.clear();
-        self.cur_buf.extend_from_slice(rec.seq);
-        Some(&self.cur_buf)
+    pub fn new(file_groups: Vec<Vec<PathBuf>>) -> Self {
+        Self {file_groups, cur_group_idx: 0}
     }
 }
 
 impl RewindableSeqStreamGenerator for SeqStreamGeneratorFromFiles {
     fn next(&mut self) -> Option<(Box<dyn SeqStream + Send + Sync>, usize)> {
-        if self.cur_file_idx == self.files.len() { return None; }
+        if self.cur_group_idx == self.file_groups.len() { return None; }
 
-        let reader = jseqio::reader::DynamicFastXReader::from_file(&self.files[self.cur_file_idx]).unwrap();
-        let reader = JSeqIOWrapper {inner: reader, cur_buf: vec![]};
+        let reader = ChainedInputStream::new(self.file_groups[self.cur_group_idx].clone());
         let reader: Box<dyn SeqStream + Send+ Sync> = Box::new(reader);
 
-        let stream_idx = self.cur_file_idx;
-        self.cur_file_idx += 1;
+        let stream_idx = self.cur_group_idx;
+        self.cur_group_idx += 1;
         Some((reader, stream_idx))
     }
 
     fn rewind(&mut self) {
-        self.cur_file_idx = 0;
+        self.cur_group_idx = 0;
     }
 }
 
