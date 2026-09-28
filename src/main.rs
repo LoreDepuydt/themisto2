@@ -81,8 +81,11 @@ pub enum Subcommands {
         color_fof: Option<PathBuf>,
 
         // The maximum number of colors is 2^32 because we use 32-bit color ids in phase 2 of the construction.
-        #[arg(help = "A fasta/fastq file, with one color per sequence. Maximum supported number of colors: 2^32.", long = "seq-colors")]
+        #[arg(help = "A fasta/fastq file, with one color per sequence. The color name of a sequence is its header up to the first space. Maximum supported number of colors: 2^32.", long = "seq-colors")]
         sequence_colors_file: Option<PathBuf>,
+
+        #[arg(help = "With --seq-colors: sequences with the same color name form a single color, instead of each sequence having its own color. Colors are numbered in the order their names first appear. Not supported with --from-unitigs if a color has more than one sequence.", long = "seq-colors-by-name", requires = "sequence_colors_file")]
+        seq_colors_by_name: bool,
 
         #[arg(help = "Precomputed bit matrix SBWT (optional). Maximum supported SBWT length: 2^40.", long = "sbwt", short = 's')]
         sbwt_path: Option<PathBuf>,
@@ -389,7 +392,7 @@ enum BuildMode {
 
 enum ColoredSeqInput {
     FileColors(Vec<Vec<PathBuf>>), // One group of files per color
-    SequenceColors(PathBuf), // One file, containing one sequence per color.
+    SequenceColors(PathBuf, Vec<usize>), // One file, and the color of each of its sequences
 }
 
 impl ColoredSeqInput {
@@ -398,8 +401,8 @@ impl ColoredSeqInput {
             ColoredSeqInput::FileColors(file_groups) => {
                 Box::new(io::SeqStreamGeneratorFromFiles::new(file_groups.clone()))
             },
-            ColoredSeqInput::SequenceColors(path_buf) => {
-                Box::new(io::SeqStreamGeneratorFromSingleFile::new(path_buf.clone()))
+            ColoredSeqInput::SequenceColors(path_buf, record_colors) => {
+                Box::new(io::SeqStreamGeneratorFromSingleFile::new(path_buf.clone(), record_colors.clone()))
             }
         }
     }
@@ -433,6 +436,31 @@ fn parse_color_fof(reader: impl BufRead) -> Result<(Vec<Vec<PathBuf>>, Vec<Strin
         file_groups[color].push(PathBuf::from(path));
     }
     Ok((file_groups, color_names))
+}
+
+/// Assigns colors to the sequences of a --seq-colors file, given the color name of each
+/// sequence. Without by_name, each sequence is its own color. With by_name, sequences with the
+/// same name are one color, and colors are numbered in the order their names first appear.
+/// Returns the color of each sequence and the color names.
+fn assign_seq_colors(seq_names: Vec<String>, by_name: bool) -> Result<(Vec<usize>, Vec<String>), String> {
+    if !by_name {
+        return Ok(((0..seq_names.len()).collect(), seq_names));
+    }
+
+    let mut record_colors = Vec::<usize>::with_capacity(seq_names.len());
+    let mut color_names = Vec::<String>::new();
+    let mut name_to_color = std::collections::HashMap::<String, usize>::new();
+    for (seq_idx, name) in seq_names.into_iter().enumerate() {
+        if name.is_empty() {
+            return Err(format!("Sequence {} of the --seq-colors file has an empty color name, which --seq-colors-by-name can not group", seq_idx + 1));
+        }
+        let color = *name_to_color.entry(name).or_insert_with_key(|name| {
+            color_names.push(name.clone());
+            color_names.len() - 1
+        });
+        record_colors.push(color);
+    }
+    Ok((record_colors, color_names))
 }
 
 // Returns the index if BuildMode is InMemory, otherwise serializes as a set of files to disk.
@@ -500,7 +528,7 @@ fn build_coloring<CSS: ColorSetStorage + Send>(sbwt: sbwt::SbwtIndex<SubsetMatri
             assert!(n_pieces != 0);
             let file_groups = match &input_mode {
                 ColoredSeqInput::FileColors(file_groups) => file_groups,
-                ColoredSeqInput::SequenceColors(_) => {
+                ColoredSeqInput::SequenceColors(..) => {
                     panic!("ToDisk mode with sequence colors is not yet supported");
                     // The issue is that the current code chunks the input files.
                     // It takes some work to translate this behaviour to a single
@@ -1027,7 +1055,7 @@ fn main() -> std::process::ExitCode {
     let args = Cli::parse();
 
     match args.command {
-        Subcommands::Build { color_fof, sequence_colors_file, output, temp_dir, k, n_threads, sample_distance, sbwt_path, lcs_path, from_unitigs, n_pieces, n_parser_threads} => {
+        Subcommands::Build { color_fof, sequence_colors_file, seq_colors_by_name, output, temp_dir, k, n_threads, sample_distance, sbwt_path, lcs_path, from_unitigs, n_pieces, n_parser_threads} => {
             if k % 2 == 0 && from_unitigs {
                 panic!("--from_unitigs requires odd k");
             }
@@ -1051,16 +1079,29 @@ fn main() -> std::process::ExitCode {
                 (None, Some(sequence_colors_file)) => {
                     // Read color names from the sequence file
                     log::info!("Reading all sequence names from the input file");
-                    let mut color_names = Vec::<String>::new();
+                    let mut seq_names = Vec::<String>::new();
                     let mut reader = needletail::parse_fastx_file(&sequence_colors_file).unwrap();
                     while let Some(rec) = reader.next() {
                         let rec = rec.unwrap();
                         let id = rec.id();
                         let name = id.split(|&b| b == b' ').next().unwrap_or(id);
-                        color_names.push(String::from_utf8(name.to_owned()).unwrap());
+                        seq_names.push(String::from_utf8(name.to_owned()).unwrap());
                     }
-                    log::info!("Read {} sequences", color_names.len());
-                    (ColoredSeqInput::SequenceColors(sequence_colors_file.clone()), vec![sequence_colors_file], color_names)
+                    log::info!("Read {} sequences", seq_names.len());
+                    let n_seqs = seq_names.len();
+                    let (record_colors, color_names) = assign_seq_colors(seq_names, seq_colors_by_name).unwrap_or_else(|e| {
+                        log::error!("{}", e);
+                        panic!("{}", e);
+                    });
+                    if seq_colors_by_name {
+                        log::info!("Grouped {} sequences into {} colors by name", n_seqs, color_names.len());
+                    }
+                    if from_unitigs && color_names.len() < n_seqs {
+                        let e = "--from-unitigs requires exactly one sequence per color, because k-mers of different sequences of the same color are not deduplicated";
+                        log::error!("{}", e);
+                        panic!("{}", e);
+                    }
+                    (ColoredSeqInput::SequenceColors(sequence_colors_file.clone(), record_colors), vec![sequence_colors_file], color_names)
                 },
             };
 
@@ -1260,6 +1301,67 @@ mod tests {
         assert_eq!(names, vec!["a.fna", "X", "Y"]);
         let paths = |v: &[&str]| -> Vec<PathBuf> { v.iter().map(PathBuf::from).collect() };
         assert_eq!(groups, vec![paths(&["a.fna", "a.fna"]), paths(&["b.fna", "d.fna"]), paths(&["c.fna"])]);
+    }
+
+    fn names(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn test_assign_seq_colors_duplicate_names_collapse() {
+        let (colors, color_names) = super::assign_seq_colors(names(&["chr1", "chr1", "chr1", "chr2", "chr2"]), true).unwrap();
+        assert_eq!(colors, vec![0, 0, 0, 1, 1]);
+        assert_eq!(color_names, names(&["chr1", "chr2"]));
+    }
+
+    #[test]
+    fn test_assign_seq_colors_distinct_names() {
+        // With distinct names, grouping by name gives the same colors as one color per sequence
+        for by_name in [false, true] {
+            let (colors, color_names) = super::assign_seq_colors(names(&["a", "b", "c"]), by_name).unwrap();
+            assert_eq!(colors, vec![0, 1, 2]);
+            assert_eq!(color_names, names(&["a", "b", "c"]));
+        }
+    }
+
+    #[test]
+    fn test_assign_seq_colors_mixed() {
+        let (colors, color_names) = super::assign_seq_colors(names(&["x", "y", "x", "z", "y", "w", "x"]), true).unwrap();
+        assert_eq!(colors, vec![0, 1, 0, 2, 1, 3, 0]);
+        assert_eq!(color_names, names(&["x", "y", "z", "w"]));
+    }
+
+    #[test]
+    fn test_assign_seq_colors_without_by_name_keeps_one_color_per_sequence() {
+        let (colors, color_names) = super::assign_seq_colors(names(&["chr1", "chr1", "chr2"]), false).unwrap();
+        assert_eq!(colors, vec![0, 1, 2]);
+        assert_eq!(color_names, names(&["chr1", "chr1", "chr2"]));
+    }
+
+    #[test]
+    fn test_assign_seq_colors_single_sequence() {
+        for by_name in [false, true] {
+            let (colors, color_names) = super::assign_seq_colors(names(&["only"]), by_name).unwrap();
+            assert_eq!(colors, vec![0]);
+            assert_eq!(color_names, names(&["only"]));
+        }
+    }
+
+    #[test]
+    fn test_assign_seq_colors_all_same_name() {
+        let (colors, color_names) = super::assign_seq_colors(names(&["s", "s", "s", "s"]), true).unwrap();
+        assert_eq!(colors, vec![0, 0, 0, 0]);
+        assert_eq!(color_names, names(&["s"]));
+    }
+
+    #[test]
+    fn test_assign_seq_colors_empty_name() {
+        // Grouping would silently merge all unnamed sequences into one color, so it is an error
+        assert!(super::assign_seq_colors(names(&["a", "", "a"]), true).is_err());
+        // Without grouping, unnamed sequences are still accepted, one color each
+        let (colors, color_names) = super::assign_seq_colors(names(&["", ""]), false).unwrap();
+        assert_eq!(colors, vec![0, 1]);
+        assert_eq!(color_names, names(&["", ""]));
     }
 
     #[test]
