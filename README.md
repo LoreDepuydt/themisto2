@@ -80,6 +80,17 @@ ggcat build -l input_file_list.txt -o unitigs-k31.fna -s 1 -k 31 -t temp -j 32 -
 
 This uses 64 GiB of RAM and 32 threads, with k = 31. The option `-s 1` is very important: otherwise GGCAT  discards k-mers occurring only once. Giving more RAM generally speeds up the construction.
 
+These unitigs contain the k-mers of all input files together, without colors. They are only used to build the SBWT in Step 2. The colors are assigned in Step 3 from the original input files.
+
+<!-- TODO(lore): verify with GGCAT that a list with "path<TAB>name" lines indeed fails or misbehaves
+     (ggcat build -l on such a list), and that the cut -f1 copy works. -->
+If `input_file_list.txt` gives color names (a tab and a name after the filename, see above), give GGCAT a copy of the list with only the filenames, since GGCAT expects one filename per line:
+
+```
+cut -f1 input_file_list.txt > ggcat_file_list.txt
+ggcat build -l ggcat_file_list.txt -o unitigs-k31.fna -s 1 -k 31 -t temp -j 32 -m 64 -p
+```
+
 ## Step 2: SBWT
 
 Built the SBWT using the SBWT Rust tool.
