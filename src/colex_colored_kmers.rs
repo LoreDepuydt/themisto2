@@ -776,6 +776,7 @@ impl<CSS: ColorSetStorage> CompactColexKmers<CSS> {
         &self.sets
     }
 
+    #[allow(dead_code)]
     pub fn get_color_names(&self) -> &Vec<String> {
         &self.color_names
     }

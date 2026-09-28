@@ -347,6 +347,9 @@ pub struct ElementGeneratorFromMergeInterleaving<'a, CSS: ColorSetStorage + Sync
     pub coloring2: &'a CompactColexKmers<CSS>,
     pub merged_key_kmer_marks: &'a bitvec::vec::BitVec, // Only reporting set elements for these
     pub filter: Option<Arc<simple_sds_sbwt::bit_vector::BitVector>>, // With rank support
+    // Maps each color of coloring2 to its color id in the merged coloring. Ids smaller than
+    // the number of colors of coloring1 are colors shared with coloring1.
+    pub color2_to_merged: &'a [usize],
 }
 
 struct ThreadInput {
@@ -397,29 +400,57 @@ impl<'a, CSS: ColorSetStorage + Sync + Send> ParallelElementGenerator for Elemen
             n_bits_s2 += s2[range.clone()].count_ones();
         }
 
+        let n_colors1 = self.coloring1.get_set_storage().n_colors();
+        assert_eq!(self.color2_to_merged.len(), self.coloring2.get_set_storage().n_colors());
+        // Marks the colors of coloring1 that coloring2 also has. Merged ids below n_colors1 are
+        // exactly the colors of coloring1.
+        let mut is_shared1 = bitvec::bitvec![0; n_colors1];
+        for &color in self.color2_to_merged.iter().filter(|&&c| c < n_colors1) {
+            is_shared1.set(color, true);
+        }
+        let has_shared_colors = is_shared1.any();
+
         let bar = indicatif::ProgressBar::new(n as u64);
-        thread_inputs.into_par_iter().for_each(|input| {
+        thread_inputs.into_par_iter().for_each(|input| { //TODO: not sure if some check are overkill
             let mut s1_colex = input.s1_start_rank;
             let mut s2_colex = input.s2_start_rank;
-            let offset_for_colors_from_2 = self.coloring1.get_set_storage().n_colors();
+            // The shared colors of coloring1 at the current k-mer, as a bitmap for O(1) lookups
+            // and as a list for clearing the bitmap afterwards. Not allocated without shared colors.
+            let mut in_set1 = bitvec::bitvec![0; if has_shared_colors { n_colors1 } else { 0 }];
+            let mut in_set1_list = Vec::<usize>::new();
             for merged_colex in input.merged_range {
                 if merged_colex > 0 && merged_colex % 10000 == 0 {
                     bar.inc(10000);
                 }
                 if self.merged_key_kmer_marks[merged_colex] {
-                    if self.interleaving.s1[merged_colex] {
-                        for color in self.coloring1.colex_to_set(s1_colex).iter() {
-                            if let Some(new_set_id) = self.maybe_apply_filter(merged_colex) {
+                    if let Some(new_set_id) = self.maybe_apply_filter(merged_colex) {
+                        let in_1 = self.interleaving.s1[merged_colex];
+                        let in_2 = self.interleaving.s2[merged_colex];
+                        // A shared color may be in both sets. It must be reported only once.
+                        let dedup = has_shared_colors && in_1 && in_2;
+
+                        if in_1 {
+                            for color in self.coloring1.colex_to_set(s1_colex).iter() {
+                                callback(SetElement{set_id: new_set_id, color});
+                                if dedup && is_shared1[color] {
+                                    in_set1.set(color, true);
+                                    in_set1_list.push(color);
+                                }
+                            }
+                        }
+
+                        if in_2 {
+                            for color in self.coloring2.colex_to_set(s2_colex).iter() {
+                                let color = self.color2_to_merged[color];
+                                if dedup && color < n_colors1 && in_set1[color] {
+                                    continue; // Already reported from coloring1
+                                }
                                 callback(SetElement{set_id: new_set_id, color});
                             }
                         }
-                    }
 
-                    if self.interleaving.s2[merged_colex] {
-                        for color in self.coloring2.colex_to_set(s2_colex).iter() {
-                            if let Some(new_set_id) = self.maybe_apply_filter(merged_colex) {
-                                callback(SetElement{set_id: new_set_id, color: color + offset_for_colors_from_2});
-                            }
+                        for color in in_set1_list.drain(..) { //TODO: not sure about this
+                            in_set1.set(color, false);
                         }
                     }
                 }
