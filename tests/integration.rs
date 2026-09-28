@@ -68,6 +68,57 @@ fn file_colors_and_seq_colors_single_seq_per_color_produce_same_index() {
     assert_eq!(bytes1, bytes2, "Indexes built with --file-colors and --seq-colors differ");
 }
 
+#[test]
+fn file_colors_with_grouped_files_match_concatenated_files() {
+    let dir = tmp_dir();
+    let build = |fof: &PathBuf, name: &str| -> PathBuf {
+        let tmp = dir.join(format!("{}-tmp", name));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let index = dir.join(format!("{}.thm2", name));
+        let status = themisto2()
+            .args(["build", "--file-colors"]).arg(fof)
+            .args(["--temp-dir"]).arg(&tmp)
+            .args(["-k", "3", "-t", "1", "-o"]).arg(&index)
+            .status()
+            .unwrap();
+        assert!(status.success(), "build of {} failed", name);
+        index
+    };
+
+    // color1 and color2 are listed separately but have the same color name, so they form one color
+    let grouped = build(&PathBuf::from("tests/data/fof-grouped.txt"), "grouped");
+
+    // The concatenated file is generated rather than checked in, so it can not get out of sync
+    // with color1.fna and color2.fna
+    let concatenated_file = dir.join("AB.fna");
+    let concatenated = [std::fs::read("tests/data/color1.fna").unwrap(), std::fs::read("tests/data/color2.fna").unwrap()].concat();
+    std::fs::write(&concatenated_file, concatenated).unwrap();
+    let concatenated_fof = dir.join("fof-concatenated.txt");
+    write_file(&concatenated_fof, &format!("{}\tAB\ntests/data/color3.fna\tC\n", concatenated_file.display()));
+    let concatenated = build(&concatenated_fof, "concatenated");
+
+    let names = themisto2()
+        .args(["dump-color-names", "-i"]).arg(&grouped)
+        .output().unwrap();
+    assert!(names.status.success());
+    assert_eq!(String::from_utf8(names.stdout).unwrap(), "0\tAB\n1\tC\n");
+
+    assert_eq!(std::fs::read(&grouped).unwrap(), std::fs::read(&concatenated).unwrap(),
+        "Index with grouped files differs from index with concatenated files");
+}
+
+#[test]
+fn file_colors_with_grouped_files_rejects_from_unitigs() {
+    let dir = tmp_dir();
+    let output = themisto2()
+        .args(["build", "--from-unitigs", "--file-colors", "tests/data/fof-grouped.txt"])
+        .args(["--temp-dir"]).arg(&dir)
+        .args(["-k", "3", "-t", "1", "-o"]).arg(dir.join("index.thm2"))
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+}
+
 fn read_jsonl(path: &PathBuf) -> Vec<PseudoalignmentRecord> {
     let text = std::fs::read_to_string(path).unwrap();
     text.lines()

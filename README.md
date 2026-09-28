@@ -40,6 +40,16 @@ themisto2 build --file-colors example/fof.txt -o index.thm2 --temp-dir temp -k 5
 
 Here `example/fof.txt` is a file with one fasta/fastq filename per line (each file represents one color), `index.thm2` is the output index, `temp` is a directory for temporary files, and `-k 5` sets the k-mer length. The first file in the input list is assigned to color id 0, the next file to color id 1, and so on.
 
+You can give a color a name of your own by writing it after the filename, separated by a tab. Files with the same color name form a single color, so several files of the same species or sample can share one color:
+
+```
+genomes/ecoli_1.fna E_coli
+genomes/ecoli_2.fna	E_coli
+genomes/saureus.fna	S_aureus
+```
+
+Colors are then numbered in the order their names first appear (here `E_coli` is color 0 and `S_aureus` is color 1). Grouping several files into one color is not supported with `--from-unitigs`.
+
 Once the index is built, you can pseudoalign queries against it:
 
 ```

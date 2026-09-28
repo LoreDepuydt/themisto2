@@ -77,7 +77,7 @@ pub enum Subcommands {
     Build {
 
         // The maximum number of colors is 2^32 because we use 32-bit color ids in phase 2 of the construction.
-        #[arg(help = "A file with one fasta/fastq filename per line. Maximum supported number of colors: 2^32.", long = "file-colors")]
+        #[arg(help = "A file with one fasta/fastq filename per line, optionally followed by a tab and a color name. A line without a color name uses the filename as the color name. Maximum supported number of colors: 2^32.", long = "file-colors")]
         color_fof: Option<PathBuf>,
 
         // The maximum number of colors is 2^32 because we use 32-bit color ids in phase 2 of the construction.
@@ -403,6 +403,36 @@ impl ColoredSeqInput {
             }
         }
     }
+}
+
+/// Parses a --file-colors file. Each non-empty line is a path, optionally followed by a tab and
+/// a color name. A line without a name uses the path as its name. Lines with the same name are
+/// one color. Colors are numbered in the order their names first appear. Returns the files of
+/// each color and the color names.
+fn parse_color_fof(reader: impl BufRead) -> Result<(Vec<Vec<PathBuf>>, Vec<String>), String> {
+    let mut file_groups = Vec::<Vec<PathBuf>>::new();
+    let mut color_names = Vec::<String>::new();
+    let mut name_to_color = std::collections::HashMap::<String, usize>::new();
+    for (line_idx, line) in reader.lines().enumerate() {
+        let line = line.map_err(|e| format!("Error reading the --file-colors file: {}", e))?;
+        if line.is_empty() { continue; }
+
+        let (path, name) = match line.split_once('\t') {
+            Some((path, name)) => (path, name),
+            None => (line.as_str(), line.as_str()),
+        };
+        if path.is_empty() || name.is_empty() {
+            return Err(format!("Line {} of the --file-colors file has an empty path or color name: {:?}", line_idx + 1, line));
+        }
+
+        let color = *name_to_color.entry(name.to_string()).or_insert_with(|| {
+            file_groups.push(Vec::new());
+            color_names.push(name.to_string());
+            color_names.len() - 1
+        });
+        file_groups[color].push(PathBuf::from(path));
+    }
+    Ok((file_groups, color_names))
 }
 
 // Returns the index if BuildMode is InMemory, otherwise serializes as a set of files to disk.
@@ -1006,11 +1036,16 @@ fn main() -> std::process::ExitCode {
                 (None, None) => panic!("Must give one of --file-colors or --seq-colors"),
                 (Some(_), Some(_)) => todo!("Must not give both --file-colors and --seq-colors"),
                 (Some(color_fof), None) => {
-                    let input_paths: Vec<PathBuf> = BufReader::new(File::open(color_fof).unwrap()).lines().map(|f| PathBuf::from(f.unwrap())).collect();
-
-                    // Use input paths also as color names
-                    let color_names: Vec<String> = input_paths.iter().map(|p| p.clone().into_os_string().into_string().unwrap()).collect();
-                    let file_groups = input_paths.iter().map(|p| vec![p.clone()]).collect();
+                    let (file_groups, color_names) = parse_color_fof(BufReader::new(File::open(color_fof).unwrap())).unwrap_or_else(|e| {
+                        log::error!("{}", e);
+                        panic!("{}", e);
+                    });
+                    if from_unitigs && file_groups.iter().any(|group| group.len() > 1) {
+                        let e = "--from-unitigs requires exactly one file per color, because k-mers of different files of the same color are not deduplicated";
+                        log::error!("{}", e);
+                        panic!("{}", e);
+                    }
+                    let input_paths: Vec<PathBuf> = file_groups.concat();
                     (ColoredSeqInput::FileColors(file_groups), input_paths, color_names)
                 }
                 (None, Some(sequence_colors_file)) => {
@@ -1212,4 +1247,24 @@ fn main() -> std::process::ExitCode {
     }
 
     ExitCode::SUCCESS
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    #[test]
+    fn test_parse_color_fof() {
+        let fof = "a.fna\nb.fna\tX\n\nc.fna\tY\nd.fna\tX\na.fna\n";
+        let (groups, names) = super::parse_color_fof(fof.as_bytes()).unwrap();
+        assert_eq!(names, vec!["a.fna", "X", "Y"]);
+        let paths = |v: &[&str]| -> Vec<PathBuf> { v.iter().map(PathBuf::from).collect() };
+        assert_eq!(groups, vec![paths(&["a.fna", "a.fna"]), paths(&["b.fna", "d.fna"]), paths(&["c.fna"])]);
+    }
+
+    #[test]
+    fn test_parse_color_fof_rejects_empty_fields() {
+        assert!(super::parse_color_fof("a.fna\t\n".as_bytes()).is_err());
+        assert!(super::parse_color_fof("\tX\n".as_bytes()).is_err());
+    }
 }
