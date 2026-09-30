@@ -346,11 +346,16 @@ pub struct ElementGeneratorFromMergeInterleaving<'a, CSS: ColorSetStorage + Sync
     pub coloring1: &'a CompactColexKmers<CSS>,
     pub coloring2: &'a CompactColexKmers<CSS>,
     pub merged_key_kmer_marks: &'a bitvec::vec::BitVec, // Only reporting set elements for these
+    // Dummy node marks of the merged SBWT. The merge may drop redundant dummy nodes that are present in
+    // the interleaving, so interleaving positions do not map 1-to-1 to merged colex positions. Non-dummy
+    // positions keep their relative order, and key k-mers are never dummies, so we map through these.
+    pub merged_dummy_marks: &'a bitvec::vec::BitVec,
     pub filter: Option<Arc<simple_sds_sbwt::bit_vector::BitVector>>, // With rank support
 }
 
 struct ThreadInput {
-    merged_range: Range<usize>,
+    interleaving_range: Range<usize>,
+    merged_start: usize, // Merged colex position of the first non-dummy k-mer at or after interleaving_range.start
     s1_start_rank: usize,
     s2_start_rank: usize,
 } 
@@ -384,30 +389,43 @@ impl<'a, CSS: ColorSetStorage + Sync + Send> ParallelElementGenerator for Elemen
         let thread_ranges = crate::util::segment_range(0..n, n_threads);
         let mut thread_inputs = Vec::<ThreadInput>::with_capacity(n_threads);
 
+        let is_dummy = &self.interleaving.is_dummy;
+        let merged_dummy_marks = self.merged_dummy_marks;
+        assert_eq!(is_dummy.count_zeros(), merged_dummy_marks.count_zeros());
+
         let mut n_bits_s1 = 0_usize;
         let mut n_bits_s2 = 0_usize;
+        let mut merged_start = merged_dummy_marks.first_zero().unwrap_or(merged_dummy_marks.len());
         for range in thread_ranges.iter() {
             let input = ThreadInput {
-                merged_range: range.clone(),
+                interleaving_range: range.clone(),
+                merged_start,
                 s1_start_rank: n_bits_s1,
                 s2_start_rank: n_bits_s2,
             };
             thread_inputs.push(input);
             n_bits_s1 += s1[range.clone()].count_ones();
             n_bits_s2 += s2[range.clone()].count_ones();
+            let n_real = is_dummy[range.clone()].count_zeros();
+            if n_real > 0 {
+                // Skip past the n_real non-dummy positions of this range in the merged SBWT
+                merged_start = merged_dummy_marks[merged_start..].iter_zeros().nth(n_real).map_or(merged_dummy_marks.len(), |i| merged_start + i);
+            }
         }
 
         let bar = indicatif::ProgressBar::new(n as u64);
         thread_inputs.into_par_iter().for_each(|input| {
             let mut s1_colex = input.s1_start_rank;
             let mut s2_colex = input.s2_start_rank;
+            let mut merged_colex = input.merged_start;
             let offset_for_colors_from_2 = self.coloring1.get_set_storage().n_colors();
-            for merged_colex in input.merged_range {
-                if merged_colex > 0 && merged_colex % 10000 == 0 {
+            for pos in input.interleaving_range {
+                if pos > 0 && pos % 10000 == 0 {
                     bar.inc(10000);
                 }
-                if self.merged_key_kmer_marks[merged_colex] {
-                    if self.interleaving.s1[merged_colex] {
+                let is_real = !is_dummy[pos];
+                if is_real && self.merged_key_kmer_marks[merged_colex] {
+                    if self.interleaving.s1[pos] {
                         for color in self.coloring1.colex_to_set(s1_colex).iter() {
                             if let Some(new_set_id) = self.maybe_apply_filter(merged_colex) {
                                 callback(SetElement{set_id: new_set_id, color});
@@ -415,7 +433,7 @@ impl<'a, CSS: ColorSetStorage + Sync + Send> ParallelElementGenerator for Elemen
                         }
                     }
 
-                    if self.interleaving.s2[merged_colex] {
+                    if self.interleaving.s2[pos] {
                         for color in self.coloring2.colex_to_set(s2_colex).iter() {
                             if let Some(new_set_id) = self.maybe_apply_filter(merged_colex) {
                                 callback(SetElement{set_id: new_set_id, color: color + offset_for_colors_from_2});
@@ -423,8 +441,12 @@ impl<'a, CSS: ColorSetStorage + Sync + Send> ParallelElementGenerator for Elemen
                         }
                     }
                 }
-                s1_colex += self.interleaving.s1[merged_colex] as usize;
-                s2_colex += self.interleaving.s2[merged_colex] as usize;
+                s1_colex += self.interleaving.s1[pos] as usize;
+                s2_colex += self.interleaving.s2[pos] as usize;
+                if is_real {
+                    // Advance to the next non-dummy position in the merged SBWT
+                    merged_colex = merged_dummy_marks[merged_colex+1..].first_zero().map_or(merged_dummy_marks.len(), |i| merged_colex + 1 + i);
+                }
             }
         });
         bar.finish();

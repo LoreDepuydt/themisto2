@@ -180,6 +180,8 @@ pub fn merge_compact_colex_kmers<CSS: ColorSetStorage + Send + Sync>(coloring1: 
     let (new_key_kmer_marks, _, _) = mark_new_key_kmers(&coloring1, &coloring2, &merged_sbwt, &merged_sbwt_lcs, &merged_dbg, sample_distance, n_threads);
     log::info!("Marked {:.2} % of all k-mers", new_key_kmer_marks.count_ones() as f64 / merged_sbwt.n_kmers() as f64 * 100.0);
 
+    let merged_dummy_marks = merged_sbwt.compute_dummy_node_marks();
+
     log::info!("=== PHASE 2/3: Building color set finperprints for key k-mers ===");
     let random_seed = 123123; // Todo: be more random
     let gen = ElementGeneratorFromMergeInterleaving {
@@ -187,6 +189,7 @@ pub fn merge_compact_colex_kmers<CSS: ColorSetStorage + Send + Sync>(coloring1: 
         coloring1: &coloring1,
         coloring2: &coloring2,
         merged_key_kmer_marks: &new_key_kmer_marks,
+        merged_dummy_marks: &merged_dummy_marks,
         filter: None,
     } ;
 
@@ -204,6 +207,7 @@ pub fn merge_compact_colex_kmers<CSS: ColorSetStorage + Send + Sync>(coloring1: 
         coloring1: &coloring1,
         coloring2: &coloring2,
         merged_key_kmer_marks: &new_key_kmer_marks,
+        merged_dummy_marks: &merged_dummy_marks,
         filter: None,
     } ;
     log::info!("=== PHASE 3/3: Build the distinct color set storage ===");
