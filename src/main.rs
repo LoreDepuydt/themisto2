@@ -12,7 +12,7 @@ use colex_colored_kmers::CompactColexKmers;
 use coloring_interface::{ColorSetStorage, ColorSetView};
 use io::RewindableSeqStreamGenerator;
 use parallel_ms_iteration::{DeduplicatingColorElementGenerator};
-use sbwt::{BitPackedKmerSortingDisk, LcsArray, SbwtIndex, StreamingIndex, SubsetMatrix, dbg::Dbg};
+use sbwt::{BitPackedKmerSortingDisk, LcsArray, SbwtIndex, StreamingIndex, SubsetMatrix, dbg::Dbg, sbwt_index_variant::SbwtIndexVariant};
 use simple_sds_sbwt::ops::{BitVec, Rank};
 use sparse_dense_storage::SparseDenseStorage;
 
@@ -882,7 +882,12 @@ fn get_sbwt_and_lcs(sbwt_path: &Option<PathBuf>, lcs_path: &Option<PathBuf>, tem
     let (sbwt, lcs) = if let Some(sbwt_path) = sbwt_path {
         log::info!("Loading SBWT from {}", sbwt_path.display());
         let mut sbwt_in = BufReader::new(File::open(sbwt_path).unwrap());
-        let sbwt::SbwtIndexVariant::SubsetMatrix(mut sbwt) = sbwt::load_sbwt_index_variant(&mut sbwt_in).unwrap();
+        // TODO: support other SBWT variants (e.g. SubsetCorrectionSets) instead of only SubsetMatrix.
+        // Themisto is hardcoded to SbwtIndex<SubsetMatrix> throughout, so this needs generics or a conversion.
+        let SbwtIndexVariant::SubsetMatrix(mut sbwt) = SbwtIndexVariant::load(&mut sbwt_in).unwrap() else {
+            log::error!("Only SBWT indexes with the SubsetMatrix subset rank structure are supported");
+            std::process::exit(1);
+        };
 
         assert_eq!(sbwt.k(), k);
 
@@ -900,14 +905,13 @@ fn get_sbwt_and_lcs(sbwt_path: &Option<PathBuf>, lcs_path: &Option<PathBuf>, tem
     } else {
         log::info!("SBWT not provided -> building the SBWT.");
         let temp_dir = temp_dir.as_ref().expect("Tempory directory not specified (must be specified for SBWT construction)");
-        let (mut sbwt, lcs) = sbwt::SbwtIndexBuilder::new()
+        let (mut sbwt, lcs) = BitPackedKmerSortingDisk::new(input_stream, k)
             .add_rev_comp(true)
-            .k(k)
             .build_lcs(true)
             .n_threads(n_threads)
-            .precalc_length(8)
-            .algorithm(BitPackedKmerSortingDisk::new().dedup_batches(true).temp_dir(temp_dir))
-        .run(input_stream);
+            .dedup_batches(true)
+            .temp_dir(temp_dir)
+            .run();
         log::info!("Building SBWT select support");
         sbwt.build_select();
         let sbwt = sbwt;
@@ -1146,7 +1150,11 @@ fn main() -> std::process::ExitCode {
         Subcommands::ImportSbwt { sbwt_path, lcs_path, output, sample_distance, n_threads, color_name } => {
             log::info!("Loading SBWT from {}", sbwt_path.display());
             let mut sbwt_in = BufReader::new(File::open(&sbwt_path).unwrap());
-            let sbwt::SbwtIndexVariant::SubsetMatrix(mut sbwt) = sbwt::load_sbwt_index_variant(&mut sbwt_in).unwrap();
+            // TODO: support other SBWT variants, see get_sbwt_and_lcs
+            let SbwtIndexVariant::SubsetMatrix(mut sbwt) = SbwtIndexVariant::load(&mut sbwt_in).unwrap() else {
+                log::error!("Only SBWT indexes with the SubsetMatrix subset rank structure are supported");
+                std::process::exit(1);
+            };
 
             log::info!("Building select support for SBWT");
             sbwt.build_select();
