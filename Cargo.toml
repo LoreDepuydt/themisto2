@@ -59,5 +59,10 @@ sha1 = "0.10.6"
 human_bytes = "0.4.3"
 memory-stats = "1.2.0"
 
+# Development override: build against the local sbwt checkout until the
+# merge-strip-option changes are released. Remove this section afterwards.
+[patch.crates-io]
+sbwt = { path = "../externalSoftware/SBWT/sbwt-rs-cli/api" }
+
 [profile.release]
 debug = true      # keep symbols so profilers can show Rust function names
