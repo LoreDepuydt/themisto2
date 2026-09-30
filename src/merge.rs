@@ -142,7 +142,9 @@ fn mark_new_key_kmers<'a, 'b, CSS: ColorSetStorage + Send + Sync>(coloring1: &'a
     (key_kmer_marks.into_bitvec(), dbg1, dbg2)
 }
 
-pub fn merge_compact_colex_kmers<CSS: ColorSetStorage + Send + Sync>(coloring1: CompactColexKmers<CSS>, coloring2: CompactColexKmers<CSS>, optimize_peak_ram: bool, sample_distance: usize, n_threads: usize) -> CompactColexKmers<CSS> {
+// If keep_redundant_dummies is true, the dummy nodes that become redundant in the SBWT merge are kept.
+// The result has the same k-mers and colors, but possibly more dummy nodes.
+pub fn merge_compact_colex_kmers<CSS: ColorSetStorage + Send + Sync>(coloring1: CompactColexKmers<CSS>, coloring2: CompactColexKmers<CSS>, optimize_peak_ram: bool, keep_redundant_dummies: bool, sample_distance: usize, n_threads: usize) -> CompactColexKmers<CSS> {
 
     log::info!("Computing the sbwt merge plan");
     let merge_plan = sbwt::MergeInterleaving::new(coloring1.sbwt(), coloring2.sbwt(), optimize_peak_ram, n_threads);
@@ -161,7 +163,11 @@ pub fn merge_compact_colex_kmers<CSS: ColorSetStorage + Send + Sync>(coloring1: 
     let merge_plan = Arc::new(merge_plan);
 
     // The clones here close just the Arcs.
-    let mut merged_sbwt = sbwt::merge(sbwt1.clone(), sbwt2.clone(), merge_plan.clone(), precalc_len, n_threads); 
+    let mut merged_sbwt = if keep_redundant_dummies {
+        sbwt::merge_without_cleanup(sbwt1.clone(), sbwt2.clone(), merge_plan.clone(), precalc_len, n_threads)
+    } else {
+        sbwt::merge(sbwt1.clone(), sbwt2.clone(), merge_plan.clone(), precalc_len, n_threads)
+    };
     merged_sbwt.build_select();
 
     // Put the coloring structs back together
@@ -337,6 +343,15 @@ mod tests {
 
     #[test]
     fn test_merge() {
+        check_merge(false);
+    }
+
+    #[test]
+    fn test_merge_keep_redundant_dummies() {
+        check_merge(true);
+    }
+
+    fn check_merge(keep_redundant_dummies: bool) {
 
         // Opt-in logging: set RUST_LOG=info to see output; silent by default.
         let _ = env_logger::try_init();
@@ -455,8 +470,16 @@ mod tests {
             let ccc2 = CompactColexKmers::new(sbwt2, lcs2, colex_map_2, storage_2, None);
             let ccc_both = CompactColexKmers::new(sbwt_both, lcs_both, colex_map_both, storage_both, None);
 
-            let ccc_merged = super::merge_compact_colex_kmers(ccc1, ccc2, true, 5, n_threads);
+            let ccc_merged = super::merge_compact_colex_kmers(ccc1, ccc2, true, keep_redundant_dummies, 5, n_threads);
             let sbwt_merged = &ccc_merged.sbwt();
+
+            assert_eq!(sbwt_merged.n_kmers(), ccc_both.sbwt().n_kmers());
+            if keep_redundant_dummies {
+                assert!(sbwt_merged.n_sets() >= ccc_both.sbwt().n_sets());
+            } else {
+                // With the redundant dummies removed, we get the same nodes as when building from scratch
+                assert_eq!(sbwt_merged.n_sets(), ccc_both.sbwt().n_sets());
+            }
 
             for colex in 0..ccc_both.sbwt().n_sets() {
                 let kmer = ccc_both.sbwt().access_kmer(colex);

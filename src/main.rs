@@ -240,6 +240,9 @@ pub enum Subcommands {
 
         #[arg(long = "low-ram-mode", help = "Use more slower but more compact algorithm invert and merge SBWTs")]
         low_ram_mode: bool,
+
+        #[arg(long = "keep-redundant-dummies", help = "Do not remove the dummy nodes that become redundant when merging SBWTs. The result has the same k-mers and colors, but may have more dummy nodes.")]
+        keep_redundant_dummies: bool,
     },
 
     #[command(arg_required_else_help = true)]
@@ -748,7 +751,7 @@ fn threshold_pseudoalignment<CSS: ColorSetStorage + Send + Sync>(index: &Compact
     log::info!("Finished");
 }
 
-fn run_merge_tree(infiles: &[PathBuf], temp_dir: &Path, outfile: &Path, n_threads: usize, low_ram_mode: bool, sample_distance: usize) {
+fn run_merge_tree(infiles: &[PathBuf], temp_dir: &Path, outfile: &Path, n_threads: usize, low_ram_mode: bool, keep_redundant_dummies: bool, sample_distance: usize) {
     let n_rounds = (infiles.len().next_power_of_two()).trailing_zeros() as usize;
     let mut current_files: Vec<PathBuf> = infiles.to_vec();
     for round in 0..n_rounds {
@@ -769,7 +772,7 @@ fn run_merge_tree(infiles: &[PathBuf], temp_dir: &Path, outfile: &Path, n_thread
                 match (colors1, colors2) {
                     (IndexVariant::SparseDenseIndex(c1), IndexVariant::SparseDenseIndex(c2)) => {
                         log::info!("Merging sparse-dense indexes");
-                        let merged_colored_kmers = merge::merge_compact_colex_kmers(c1, c2, low_ram_mode, sample_distance, n_threads);
+                        let merged_colored_kmers = merge::merge_compact_colex_kmers(c1, c2, low_ram_mode, keep_redundant_dummies, sample_distance, n_threads);
                         log::info!("Serializing merged index to {}", outpath.display());
                         write_index_variant(&IndexVariant::SparseDenseIndex(merged_colored_kmers), &mut out);
                     },
@@ -1111,9 +1114,9 @@ fn main() -> std::process::ExitCode {
             log::info!("Dumping color names");
             print_color_names(&color_names, out);
         },
-        Subcommands::Merge { index_file_list, temp_dir, outfile, n_threads, low_ram_mode, sample_distance } => {
+        Subcommands::Merge { index_file_list, temp_dir, outfile, n_threads, low_ram_mode, keep_redundant_dummies, sample_distance } => {
             let infiles: Vec<PathBuf> = BufReader::new(File::open(index_file_list).unwrap()).lines().map(|f| PathBuf::from(f.unwrap())).collect();
-            run_merge_tree(&infiles, &temp_dir, &outfile, n_threads, low_ram_mode, sample_distance);
+            run_merge_tree(&infiles, &temp_dir, &outfile, n_threads, low_ram_mode, keep_redundant_dummies, sample_distance);
         },
         Subcommands::Import { sbwt_path, lcs_path, color_dump_prefix, out: out_path, n_threads, temp_dir, sample_distance} => {
             let unitig_filename = format!("{}.unitigs.fa", color_dump_prefix.to_str().unwrap());
