@@ -346,16 +346,16 @@ pub struct ElementGeneratorFromMergeInterleaving<'a, CSS: ColorSetStorage + Sync
     pub coloring1: &'a CompactColexKmers<CSS>,
     pub coloring2: &'a CompactColexKmers<CSS>,
     pub merged_key_kmer_marks: &'a bitvec::vec::BitVec, // Only reporting set elements for these
-    // Dummy node marks of the merged SBWT. The merge may drop redundant dummy nodes that are present in
-    // the interleaving, so interleaving positions do not map 1-to-1 to merged colex positions. Non-dummy
-    // positions keep their relative order, and key k-mers are never dummies, so we map through these.
-    pub merged_dummy_marks: &'a bitvec::vec::BitVec,
+    // Marks the positions of the interleaving that were removed from the merged SBWT (redundant dummy nodes).
+    // The remaining positions keep their order, so the j-th unmarked position is merged colex position j.
+    // None if nothing was removed, in which case interleaving positions are merged colex positions.
+    pub removed_positions: Option<&'a bitvec::vec::BitVec<u64, bitvec::order::Lsb0>>,
     pub filter: Option<Arc<simple_sds_sbwt::bit_vector::BitVector>>, // With rank support
 }
 
 struct ThreadInput {
     interleaving_range: Range<usize>,
-    merged_start: usize, // Merged colex position of the first non-dummy k-mer at or after interleaving_range.start
+    merged_start_colex: usize, // Merged colex position of the first position of interleaving_range that was not removed
     s1_start_rank: usize,
     s2_start_rank: usize,
 } 
@@ -389,42 +389,38 @@ impl<'a, CSS: ColorSetStorage + Sync + Send> ParallelElementGenerator for Elemen
         let thread_ranges = crate::util::segment_range(0..n, n_threads);
         let mut thread_inputs = Vec::<ThreadInput>::with_capacity(n_threads);
 
-        let is_dummy = &self.interleaving.is_dummy;
-        let merged_dummy_marks = self.merged_dummy_marks;
-        assert_eq!(is_dummy.count_zeros(), merged_dummy_marks.count_zeros());
+        let removed = self.removed_positions;
+        let n_removed = removed.map_or(0, |r| r.count_ones());
+        assert_eq!(self.merged_key_kmer_marks.len(), n - n_removed);
 
         let mut n_bits_s1 = 0_usize;
         let mut n_bits_s2 = 0_usize;
-        let mut merged_start = merged_dummy_marks.first_zero().unwrap_or(merged_dummy_marks.len());
+        let mut n_kept = 0_usize;
         for range in thread_ranges.iter() {
             let input = ThreadInput {
                 interleaving_range: range.clone(),
-                merged_start,
+                merged_start_colex: n_kept,
                 s1_start_rank: n_bits_s1,
                 s2_start_rank: n_bits_s2,
             };
             thread_inputs.push(input);
             n_bits_s1 += s1[range.clone()].count_ones();
             n_bits_s2 += s2[range.clone()].count_ones();
-            let n_real = is_dummy[range.clone()].count_zeros();
-            if n_real > 0 {
-                // Skip past the n_real non-dummy positions of this range in the merged SBWT
-                merged_start = merged_dummy_marks[merged_start..].iter_zeros().nth(n_real).map_or(merged_dummy_marks.len(), |i| merged_start + i);
-            }
+            n_kept += range.len() - removed.map_or(0, |r| r[range.clone()].count_ones());
         }
 
         let bar = indicatif::ProgressBar::new(n as u64);
         thread_inputs.into_par_iter().for_each(|input| {
             let mut s1_colex = input.s1_start_rank;
             let mut s2_colex = input.s2_start_rank;
-            let mut merged_colex = input.merged_start;
+            let mut merged_colex = input.merged_start_colex;
             let offset_for_colors_from_2 = self.coloring1.get_set_storage().n_colors();
             for pos in input.interleaving_range {
                 if pos > 0 && pos % 10000 == 0 {
                     bar.inc(10000);
                 }
-                let is_real = !is_dummy[pos];
-                if is_real && self.merged_key_kmer_marks[merged_colex] {
+                let is_removed = removed.is_some_and(|r| r[pos]);
+                if !is_removed && self.merged_key_kmer_marks[merged_colex] {
                     if self.interleaving.s1[pos] {
                         for color in self.coloring1.colex_to_set(s1_colex).iter() {
                             if let Some(new_set_id) = self.maybe_apply_filter(merged_colex) {
@@ -443,10 +439,7 @@ impl<'a, CSS: ColorSetStorage + Sync + Send> ParallelElementGenerator for Elemen
                 }
                 s1_colex += self.interleaving.s1[pos] as usize;
                 s2_colex += self.interleaving.s2[pos] as usize;
-                if is_real {
-                    // Advance to the next non-dummy position in the merged SBWT
-                    merged_colex = merged_dummy_marks[merged_colex+1..].first_zero().map_or(merged_dummy_marks.len(), |i| merged_colex + 1 + i);
-                }
+                merged_colex += !is_removed as usize; // Removed positions do not exist in the merged SBWT
             }
         });
         bar.finish();

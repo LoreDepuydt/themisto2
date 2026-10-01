@@ -163,10 +163,13 @@ pub fn merge_compact_colex_kmers<CSS: ColorSetStorage + Send + Sync>(coloring1: 
     let merge_plan = Arc::new(merge_plan);
 
     // The clones here close just the Arcs.
-    let mut merged_sbwt = if keep_redundant_dummies {
-        sbwt::merge_without_cleanup(sbwt1.clone(), sbwt2.clone(), merge_plan.clone(), precalc_len, n_threads)
+    // If the redundant dummy nodes are removed, we need to know which positions of the merge plan
+    // were removed, to map merge plan positions to colex positions of the merged SBWT.
+    let (mut merged_sbwt, removed_positions) = if keep_redundant_dummies {
+        (sbwt::merge_without_cleanup(sbwt1.clone(), sbwt2.clone(), merge_plan.clone(), precalc_len, n_threads), None)
     } else {
-        sbwt::merge(sbwt1.clone(), sbwt2.clone(), merge_plan.clone(), precalc_len, n_threads)
+        let (merged_sbwt, removed_positions) = sbwt::merge_with_removed_positions(sbwt1.clone(), sbwt2.clone(), merge_plan.clone(), precalc_len, n_threads);
+        (merged_sbwt, Some(removed_positions))
     };
     merged_sbwt.build_select();
 
@@ -186,8 +189,6 @@ pub fn merge_compact_colex_kmers<CSS: ColorSetStorage + Send + Sync>(coloring1: 
     let (new_key_kmer_marks, _, _) = mark_new_key_kmers(&coloring1, &coloring2, &merged_sbwt, &merged_sbwt_lcs, &merged_dbg, sample_distance, n_threads);
     log::info!("Marked {:.2} % of all k-mers", new_key_kmer_marks.count_ones() as f64 / merged_sbwt.n_kmers() as f64 * 100.0);
 
-    let merged_dummy_marks = merged_sbwt.compute_dummy_node_marks();
-
     log::info!("=== PHASE 2/3: Building color set finperprints for key k-mers ===");
     let random_seed = 123123; // Todo: be more random
     let gen = ElementGeneratorFromMergeInterleaving {
@@ -195,7 +196,7 @@ pub fn merge_compact_colex_kmers<CSS: ColorSetStorage + Send + Sync>(coloring1: 
         coloring1: &coloring1,
         coloring2: &coloring2,
         merged_key_kmer_marks: &new_key_kmer_marks,
-        merged_dummy_marks: &merged_dummy_marks,
+        removed_positions: removed_positions.as_ref(),
         filter: None,
     } ;
 
@@ -213,7 +214,7 @@ pub fn merge_compact_colex_kmers<CSS: ColorSetStorage + Send + Sync>(coloring1: 
         coloring1: &coloring1,
         coloring2: &coloring2,
         merged_key_kmer_marks: &new_key_kmer_marks,
-        merged_dummy_marks: &merged_dummy_marks,
+        removed_positions: removed_positions.as_ref(),
         filter: None,
     } ;
     log::info!("=== PHASE 3/3: Build the distinct color set storage ===");
