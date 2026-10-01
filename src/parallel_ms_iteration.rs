@@ -346,6 +346,10 @@ pub struct ElementGeneratorFromMergeInterleaving<'a, CSS: ColorSetStorage + Sync
     pub coloring1: &'a CompactColexKmers<CSS>,
     pub coloring2: &'a CompactColexKmers<CSS>,
     pub merged_key_kmer_marks: &'a bitvec::vec::BitVec, // Only reporting set elements for these
+    // Marks the positions of the interleaving that were removed from the merged SBWT (redundant dummy nodes).
+    // The remaining positions keep their order, so the j-th unmarked position is merged colex position j.
+    // None if nothing was removed, in which case interleaving positions are merged colex positions.
+    pub removed_positions: Option<&'a bitvec::vec::BitVec<u64, bitvec::order::Lsb0>>,
     pub filter: Option<Arc<simple_sds_sbwt::bit_vector::BitVector>>, // With rank support
     // Maps each color of coloring2 to its color id in the merged coloring. Ids smaller than
     // the number of colors of coloring1 are colors shared with coloring1.
@@ -353,7 +357,8 @@ pub struct ElementGeneratorFromMergeInterleaving<'a, CSS: ColorSetStorage + Sync
 }
 
 struct ThreadInput {
-    merged_range: Range<usize>,
+    interleaving_range: Range<usize>,
+    merged_start_colex: usize, // Merged colex position of the first position of interleaving_range that was not removed
     s1_start_rank: usize,
     s2_start_rank: usize,
 } 
@@ -387,17 +392,24 @@ impl<'a, CSS: ColorSetStorage + Sync + Send> ParallelElementGenerator for Elemen
         let thread_ranges = crate::util::segment_range(0..n, n_threads);
         let mut thread_inputs = Vec::<ThreadInput>::with_capacity(n_threads);
 
+        let removed = self.removed_positions;
+        let n_removed = removed.map_or(0, |r| r.count_ones());
+        assert_eq!(self.merged_key_kmer_marks.len(), n - n_removed);
+
         let mut n_bits_s1 = 0_usize;
         let mut n_bits_s2 = 0_usize;
+        let mut n_kept = 0_usize;
         for range in thread_ranges.iter() {
             let input = ThreadInput {
-                merged_range: range.clone(),
+                interleaving_range: range.clone(),
+                merged_start_colex: n_kept,
                 s1_start_rank: n_bits_s1,
                 s2_start_rank: n_bits_s2,
             };
             thread_inputs.push(input);
             n_bits_s1 += s1[range.clone()].count_ones();
             n_bits_s2 += s2[range.clone()].count_ones();
+            n_kept += range.len() - removed.map_or(0, |r| r[range.clone()].count_ones());
         }
 
         let n_colors1 = self.coloring1.get_set_storage().n_colors();
@@ -414,18 +426,20 @@ impl<'a, CSS: ColorSetStorage + Sync + Send> ParallelElementGenerator for Elemen
         thread_inputs.into_par_iter().for_each(|input| { //TODO: not sure if some check are overkill
             let mut s1_colex = input.s1_start_rank;
             let mut s2_colex = input.s2_start_rank;
+            let mut merged_colex = input.merged_start_colex;
             // The shared colors of coloring1 at the current k-mer, as a bitmap for O(1) lookups
             // and as a list for clearing the bitmap afterwards. Not allocated without shared colors.
             let mut in_set1 = bitvec::bitvec![0; if has_shared_colors { n_colors1 } else { 0 }];
             let mut in_set1_list = Vec::<usize>::new();
-            for merged_colex in input.merged_range {
-                if merged_colex > 0 && merged_colex % 10000 == 0 {
+            for pos in input.interleaving_range {
+                if pos > 0 && pos % 10000 == 0 {
                     bar.inc(10000);
                 }
-                if self.merged_key_kmer_marks[merged_colex] {
+                let is_removed = removed.is_some_and(|r| r[pos]);
+                if !is_removed && self.merged_key_kmer_marks[merged_colex] {
                     if let Some(new_set_id) = self.maybe_apply_filter(merged_colex) {
-                        let in_1 = self.interleaving.s1[merged_colex];
-                        let in_2 = self.interleaving.s2[merged_colex];
+                        let in_1 = self.interleaving.s1[pos];
+                        let in_2 = self.interleaving.s2[pos];
                         // A shared color may be in both sets. It must be reported only once.
                         let dedup = has_shared_colors && in_1 && in_2;
 
@@ -454,8 +468,9 @@ impl<'a, CSS: ColorSetStorage + Sync + Send> ParallelElementGenerator for Elemen
                         }
                     }
                 }
-                s1_colex += self.interleaving.s1[merged_colex] as usize;
-                s2_colex += self.interleaving.s2[merged_colex] as usize;
+                s1_colex += self.interleaving.s1[pos] as usize;
+                s2_colex += self.interleaving.s2[pos] as usize;
+                merged_colex += !is_removed as usize; // Removed positions do not exist in the merged SBWT
             }
         });
         bar.finish();
@@ -545,12 +560,10 @@ mod tests {
         let seq0: &[u8] = b"ACGCG";
         let seq1: &[u8] = b"TTTGGG";
 
-        let (sbwt, lcs) = sbwt::SbwtIndexBuilder::new()
-            .algorithm(BitPackedKmerSortingMem::new())
-            .k(k)
+        let (sbwt, lcs) = BitPackedKmerSortingMem::new_from_slices(&[seq0, seq1], k)
             .add_rev_comp(true)
             .build_lcs(true)
-            .run_from_slices(&[seq0, seq1]);
+            .run();
         let lcs = lcs.unwrap();
 
         let color_seqs: Vec<Vec<Vec<u8>>> = vec![
