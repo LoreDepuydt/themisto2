@@ -1,21 +1,45 @@
 use std::{cmp::max, collections::{HashMap, HashSet}, sync::Arc};
 
 use sbwt::{dbg::{Dbg, Node}, LcsArray, SbwtIndex, StreamingIndex, SubsetMatrix};
-use simple_sds_sbwt::ops::{BitVec, Rank};
+use simple_sds_sbwt::ops::{BitVec, Rank, Select};
 
 use crate::{atomic_bitmap::AtomicBitmap, colex_colored_kmers::{ColexToColorSetMap, CompactColexKmers}, coloring_interface::ColorSetStorage, parallel_ms_iteration::ElementGeneratorFromMergeInterleaving, set_of_sets_construction::{build_color_set_storage, find_kmers_that_cover_all_distinct_sets_from_generator_that_does_not_give_duplicates}, unitig_export::break_to_colored_subunitigs};
 
-fn mark_kmer(colex: usize, marks: &AtomicBitmap) {
-    marks.set(colex, true);
+/// Maps the colex positions of the k-mers of one input index to their colex positions in the merged
+/// index, through the merge interleaving: input position i is at interleaving position
+/// select(s, i), where s is the input's bit vector of the interleaving (s1 or s2), and that
+/// interleaving position is at merged position select(s, i) minus the number of removed
+/// interleaving positions before it. Only dummy nodes are removed, so this is valid for k-mers.
+struct ToMerged<'a> {
+    in_input: simple_sds_sbwt::bit_vector::BitVector, // s1 or s2 of the interleaving, with select support
+    removed: Option<&'a simple_sds_sbwt::bit_vector::BitVector>, // With rank support. None if nothing was removed
 }
 
-fn search_and_mark_kmer(kmer: &[u8], sbwt: &SbwtIndex<SubsetMatrix>, marks: &AtomicBitmap) {
-    let colex = sbwt.search(kmer);
-    let colex = colex.unwrap_or_else(|| panic!("k-mer not found in merged SBWT: {:?}", String::from_utf8_lossy(kmer)));
-    assert!(colex.len() == 1);
-    let colex = colex.start;
+impl<'a> ToMerged<'a> {
+    fn new(in_input: &bitvec::vec::BitVec<u64, bitvec::order::Lsb0>, removed: Option<&'a simple_sds_sbwt::bit_vector::BitVector>) -> Self {
+        // TODO: This copies s1 or s2 (n bits for n interleaving positions) only to get select
+        // support from simple-sds. A select structure directly on the bitvec of the interleaving
+        // would save that copy, at the cost of our own select code (sbwt had one, ForwardSelect,
+        // before it switched to simple-sds).
+        let mut in_input = u64_bitvec_to_simple_sds(in_input);
+        in_input.enable_select();
+        Self { in_input, removed }
+    }
 
-    mark_kmer(colex, marks);
+    fn merged_colex(&self, input_colex: usize) -> usize {
+        let pos = self.in_input.select(input_colex).unwrap();
+        pos - self.removed.map_or(0, |r| r.rank(pos))
+    }
+}
+
+fn u64_bitvec_to_simple_sds(bv: &bitvec::vec::BitVec<u64, bitvec::order::Lsb0>) -> simple_sds_sbwt::bit_vector::BitVector {
+    let mut copy = bitvec::vec::BitVec::<usize, bitvec::order::Lsb0>::from_vec(bv.as_raw_slice().iter().map(|&w| w as usize).collect());
+    copy.truncate(bv.len());
+    crate::util::bitvec_to_simple_sds_bitvec(copy)
+}
+
+fn mark_kmer(colex: usize, marks: &AtomicBitmap) {
+    marks.set(colex, true);
 }
 
 fn mark_in_neighbors<'a>(colex: usize, dbg: &Dbg<'a, SubsetMatrix>, marks: &AtomicBitmap) {
@@ -26,16 +50,8 @@ fn mark_in_neighbors<'a>(colex: usize, dbg: &Dbg<'a, SubsetMatrix>, marks: &Atom
     }
 }
 
-fn search_and_mark_in_neighbors<'a>(kmer: &[u8], sbwt: &SbwtIndex<SubsetMatrix>, dbg: &Dbg<'a, SubsetMatrix>, marks: &AtomicBitmap) {
-    let colex = sbwt.search(kmer);
-    let colex = colex.unwrap_or_else(|| panic!("k-mer not found in merged SBWT: {:?}", String::from_utf8_lossy(kmer)));
-    assert!(colex.len() == 1);
-    let colex = colex.start;
-
-    mark_in_neighbors(colex, dbg, marks);
-}
-
-fn mark_key_kmers_for<'a, CSS: ColorSetStorage + Send + Sync>(coloring: &'a CompactColexKmers<CSS>, merged_sbwt: &SbwtIndex<SubsetMatrix>, merged_lcs: &LcsArray, merged_dbg: &Dbg<'_, SubsetMatrix>, key_kmer_marks: &AtomicBitmap, visited_marks: Option<&AtomicBitmap>, n_threads: usize) -> Dbg<'a, SubsetMatrix> {
+#[allow(clippy::too_many_arguments)]
+fn mark_key_kmers_for<'a, CSS: ColorSetStorage + Send + Sync>(coloring: &'a CompactColexKmers<CSS>, to_merged: &ToMerged, merged_sbwt: &SbwtIndex<SubsetMatrix>, merged_lcs: &LcsArray, merged_dbg: &Dbg<'_, SubsetMatrix>, key_kmer_marks: &AtomicBitmap, visited_marks: Option<&AtomicBitmap>, n_threads: usize) -> Dbg<'a, SubsetMatrix> {
 
     let merged_si = StreamingIndex::new(merged_sbwt, merged_lcs);
 
@@ -48,12 +64,8 @@ fn mark_key_kmers_for<'a, CSS: ColorSetStorage + Send + Sync>(coloring: &'a Comp
     log::info!("Iterating unitigs");
     let bar = indicatif::ProgressBar::new(coloring.sbwt().n_kmers() as u64);
     dbg.iter_unitigs_with_callback(|nodes|{
-        let mut unitig = Vec::<u8>::with_capacity(nodes.len());
-        dbg.push_unitig_string(nodes, &mut unitig);
-        assert!(unitig.len() >= k);
-
         let unitig_colex_ranks = nodes.iter().map(|v| v.id).collect::<Vec<usize>>(); // TODO: avoid this allocation
-        let (_, subunitig_ranges) = break_to_colored_subunitigs(&unitig_colex_ranks, &unitig, coloring.get_map(), coloring.sbwt());
+        let (_, subunitig_ranges) = break_to_colored_subunitigs(&unitig_colex_ranks, &[], coloring.get_map(), coloring.sbwt());
 
         // Mark last k-mer of each colored subunitig, and the in-neighbors of
         // the first k-mer of each colored subunitig.
@@ -62,14 +74,11 @@ fn mark_key_kmers_for<'a, CSS: ColorSetStorage + Send + Sync>(coloring: &'a Comp
             let (s,e) = (subunitig_range.start, subunitig_range.end); 
             assert!(s < e);
 
-            // TODO: If we had access to the merge plan here we would not have to search
-            // these kmers.
-
-            let last_kmer = &unitig[e-1..e-1+k];
-            search_and_mark_kmer(last_kmer, merged_sbwt, key_kmer_marks);
-
-            let first_kmer = &unitig[s..s+k];
-            search_and_mark_in_neighbors(first_kmer, merged_sbwt, merged_dbg, key_kmer_marks);
+            // The k-mer at position j of the unitig is node j. Its position in the merged index
+            // comes from the merge interleaving, so neither the unitig string nor a search in
+            // the merged index is needed.
+            mark_kmer(to_merged.merged_colex(nodes[e-1].id), key_kmer_marks);
+            mark_in_neighbors(to_merged.merged_colex(nodes[s].id), merged_dbg, key_kmer_marks);
         }
 
         // Debug-only coverage check: record every k-mer of this unitig as visited, so
@@ -91,6 +100,8 @@ fn mark_key_kmers_for<'a, CSS: ColorSetStorage + Send + Sync>(coloring: &'a Comp
         // a merged unitig (marked by mark_new_key_kmers). Checked with an assertion on ~3700
         // random adversarial merges.)
         if let Some(visited_marks) = visited_marks {
+            let mut unitig = Vec::<u8>::with_capacity(nodes.len() + k - 1);
+            dbg.push_unitig_string(nodes, &mut unitig);
             for (match_len, colex_range) in merged_si.matching_statistics_iter(&unitig).skip(k-1) {
                 assert!(match_len == k);
                 assert!(colex_range.len() == 1);
@@ -109,7 +120,8 @@ fn mark_key_kmers_for<'a, CSS: ColorSetStorage + Send + Sync>(coloring: &'a Comp
     dbg
 }
 
-fn mark_new_key_kmers<'a, 'b, CSS: ColorSetStorage + Send + Sync>(coloring1: &'a CompactColexKmers<CSS>, coloring2: &'b CompactColexKmers<CSS>, merged_sbwt: &SbwtIndex<SubsetMatrix>, merged_lcs: &LcsArray, merged_dbg: &Dbg<'_, SubsetMatrix>, sample_distance: usize, n_threads: usize) -> (bitvec::vec::BitVec, Dbg<'a, SubsetMatrix>, Dbg<'b, SubsetMatrix>) {
+#[allow(clippy::too_many_arguments)]
+fn mark_new_key_kmers<'a, 'b, CSS: ColorSetStorage + Send + Sync>(coloring1: &'a CompactColexKmers<CSS>, coloring2: &'b CompactColexKmers<CSS>, merge_plan: &sbwt::MergeInterleaving, removed_positions: Option<&bitvec::vec::BitVec<u64, bitvec::order::Lsb0>>, merged_sbwt: &SbwtIndex<SubsetMatrix>, merged_lcs: &LcsArray, merged_dbg: &Dbg<'_, SubsetMatrix>, sample_distance: usize, n_threads: usize) -> (bitvec::vec::BitVec, Dbg<'a, SubsetMatrix>, Dbg<'b, SubsetMatrix>) {
     let k = merged_sbwt.k();
     assert_eq!(k, coloring1.get_k());
     assert_eq!(k, coloring2.get_k());
@@ -134,8 +146,23 @@ fn mark_new_key_kmers<'a, 'b, CSS: ColorSetStorage + Send + Sync>(coloring1: &'a
     // it costs a full extra streaming-index pass over the merged graph and is not needed for
     // marking key k-mers, only for catching merge bugs during development.
     let visited_marks = cfg!(debug_assertions).then(|| AtomicBitmap::new(merged_sbwt.n_sets()));
-    let dbg1 = mark_key_kmers_for(coloring1, merged_sbwt, merged_lcs, merged_dbg, &key_kmer_marks, visited_marks.as_ref(), n_threads);
-    let dbg2 = mark_key_kmers_for(coloring2, merged_sbwt, merged_lcs, merged_dbg, &key_kmer_marks, visited_marks.as_ref(), n_threads);
+    // TODO: This is a second copy of the removed positions (n bits), next to the original that
+    // colors 2 and 3 use. Converting them to simple-sds once, with rank support, and sharing that
+    // with colors 2 and 3 would save the copy.
+    let removed = removed_positions.map(|r| {
+        let mut r = u64_bitvec_to_simple_sds(r);
+        r.enable_rank();
+        r
+    });
+    let dbg1 = {
+        let to_merged = ToMerged::new(&merge_plan.s1, removed.as_ref());
+        mark_key_kmers_for(coloring1, &to_merged, merged_sbwt, merged_lcs, merged_dbg, &key_kmer_marks, visited_marks.as_ref(), n_threads)
+    };
+    let dbg2 = {
+        let to_merged = ToMerged::new(&merge_plan.s2, removed.as_ref());
+        mark_key_kmers_for(coloring2, &to_merged, merged_sbwt, merged_lcs, merged_dbg, &key_kmer_marks, visited_marks.as_ref(), n_threads)
+    };
+    drop(removed);
 
     if let Some(visited_marks) = visited_marks {
         assert_eq!(visited_marks.into_bitvec().count_ones(), merged_sbwt.n_kmers());
@@ -232,7 +259,7 @@ pub fn merge_compact_colex_kmers<CSS: ColorSetStorage + Send + Sync>(coloring1: 
     let merged_dbg = Dbg::new(&merged_sbwt, Some(&merged_sbwt_lcs), n_threads);
 
     log::info!("=== Phase 1/3: marking new key k-mers ===");
-    let (new_key_kmer_marks, _, _) = mark_new_key_kmers(&coloring1, &coloring2, &merged_sbwt, &merged_sbwt_lcs, &merged_dbg, sample_distance, n_threads);
+    let (new_key_kmer_marks, _, _) = mark_new_key_kmers(&coloring1, &coloring2, &merge_plan, removed_positions.as_ref(), &merged_sbwt, &merged_sbwt_lcs, &merged_dbg, sample_distance, n_threads);
     log::info!("Marked {:.2} % of all k-mers", new_key_kmer_marks.count_ones() as f64 / merged_sbwt.n_kmers() as f64 * 100.0);
 
     log::info!("=== PHASE 2/3: Building color set finperprints for key k-mers ===");
