@@ -3,7 +3,7 @@ use std::{cmp::max, sync::Arc};
 use sbwt::{dbg::Dbg, LcsArray};
 use simple_sds_sbwt::ops::{BitVec, Rank, Select};
 
-use crate::{atomic_bitmap::AtomicBitmap, colex_colored_kmers::{ColexToColorSetMap, CompactColexKmers}, coloring_interface::ColorSetStorage, util::u64_bitvec_to_simple_sds, set_operations::key_kmers::{mark_key_kmers_for, mark_structural_key_kmers}, parallel_ms_iteration::{ColorCombination, ElementGeneratorFromIntersectionInterleaving}, set_of_sets_construction::{build_color_set_storage, find_kmers_that_cover_all_distinct_sets_from_generator_that_does_not_give_duplicates}};
+use crate::{atomic_bitmap::AtomicBitmap, colex_colored_kmers::{ColexToColorSetMap, CompactColexKmers}, coloring_interface::ColorSetStorage, set_operations::result_positions::ToIntersection, set_operations::key_kmers::{mark_key_kmers_for, mark_structural_key_kmers}, parallel_ms_iteration::{ColorCombination, ElementGeneratorFromIntersectionInterleaving}, set_of_sets_construction::{build_color_set_storage, find_kmers_that_cover_all_distinct_sets_from_generator_that_does_not_give_duplicates}};
 
 /// How the color set of a k-mer of the intersection is computed from its color sets in the two
 /// input indexes.
@@ -14,35 +14,6 @@ pub enum IntersectColors {
     /// The intersection of the two color sets, matching colors by name. The result has only the
     /// colors whose names are in both indexes.
     Intersect,
-}
-
-/// Maps the colex positions of the k-mers of one input index to their colex positions in the
-/// intersection, through the interleaving of the inputs: input position i is at interleaving
-/// position p = select(s, i), where s is the input's bit vector of the interleaving (s1 or s2).
-/// The k-mer is in the intersection iff p is in both inputs and is not a dummy, and the
-/// intersection k-mers are in the same order as those interleaving positions. The colex positions
-/// themselves differ, because the intersection can add and remove dummy nodes.
-struct ToIntersection<'a> {
-    in_input: simple_sds_sbwt::bit_vector::BitVector, // s1 or s2 of the interleaving, with select support
-    in_result: &'a simple_sds_sbwt::bit_vector::BitVector, // Interleaving positions of the result k-mers, with rank support
-    result_kmers: &'a simple_sds_sbwt::bit_vector::BitVector, // Colex positions of the result k-mers, with select support
-}
-
-impl<'a> ToIntersection<'a> {
-    fn new(in_input: &bitvec::vec::BitVec<u64, bitvec::order::Lsb0>, in_result: &'a simple_sds_sbwt::bit_vector::BitVector, result_kmers: &'a simple_sds_sbwt::bit_vector::BitVector) -> Self {
-        // TODO: This copies s1 or s2 only to get select support, as in merge::ToMerged.
-        let mut in_input = u64_bitvec_to_simple_sds(in_input);
-        in_input.enable_select();
-        Self { in_input, in_result, result_kmers }
-    }
-
-    fn result_colex(&self, input_colex: usize) -> Option<usize> {
-        let pos = self.in_input.select(input_colex).unwrap();
-        if !self.in_result.get(pos) {
-            return None;
-        }
-        Some(self.result_kmers.select(self.in_result.rank(pos)).unwrap())
-    }
 }
 
 /// Intersects two colored indexes: the result has the k-mers that are in both indexes. The color

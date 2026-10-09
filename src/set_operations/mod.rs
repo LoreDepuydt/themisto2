@@ -2,3 +2,4 @@
 
 pub(crate) mod colors;
 pub(crate) mod key_kmers;
+pub(crate) mod result_positions;

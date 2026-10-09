@@ -1,38 +1,12 @@
 use std::{cmp::max, sync::Arc};
 
 use sbwt::{dbg::Dbg, LcsArray, SbwtIndex, SubsetMatrix};
-use simple_sds_sbwt::ops::{BitVec, Rank, Select};
+use simple_sds_sbwt::ops::{BitVec, Rank};
 
 use crate::set_operations::key_kmers::{mark_key_kmers_for, mark_structural_key_kmers};
 use crate::util::u64_bitvec_to_simple_sds;
+use crate::set_operations::result_positions::ToMerged;
 use crate::{atomic_bitmap::AtomicBitmap, colex_colored_kmers::{ColexToColorSetMap, CompactColexKmers}, coloring_interface::ColorSetStorage, parallel_ms_iteration::ElementGeneratorFromMergeInterleaving, set_of_sets_construction::{build_color_set_storage, find_kmers_that_cover_all_distinct_sets_from_generator_that_does_not_give_duplicates}};
-
-/// Maps the colex positions of the k-mers of one input index to their colex positions in the merged
-/// index, through the merge interleaving: input position i is at interleaving position
-/// select(s, i), where s is the input's bit vector of the interleaving (s1 or s2), and that
-/// interleaving position is at merged position select(s, i) minus the number of removed
-/// interleaving positions before it. Only dummy nodes are removed, so this is valid for k-mers.
-struct ToMerged<'a> {
-    in_input: simple_sds_sbwt::bit_vector::BitVector, // s1 or s2 of the interleaving, with select support
-    removed: Option<&'a simple_sds_sbwt::bit_vector::BitVector>, // With rank support. None if nothing was removed
-}
-
-impl<'a> ToMerged<'a> {
-    fn new(in_input: &bitvec::vec::BitVec<u64, bitvec::order::Lsb0>, removed: Option<&'a simple_sds_sbwt::bit_vector::BitVector>) -> Self {
-        // TODO: This copies s1 or s2 (n bits for n interleaving positions) only to get select
-        // support from simple-sds. A select structure directly on the bitvec of the interleaving
-        // would save that copy, at the cost of our own select code (sbwt had one, ForwardSelect,
-        // before it switched to simple-sds).
-        let mut in_input = u64_bitvec_to_simple_sds(in_input);
-        in_input.enable_select();
-        Self { in_input, removed }
-    }
-
-    fn merged_colex(&self, input_colex: usize) -> usize {
-        let pos = self.in_input.select(input_colex).unwrap();
-        pos - self.removed.map_or(0, |r| r.rank(pos))
-    }
-}
 
 #[allow(clippy::too_many_arguments)]
 fn mark_new_key_kmers<'a, 'b, CSS: ColorSetStorage + Send + Sync>(coloring1: &'a CompactColexKmers<CSS>, coloring2: &'b CompactColexKmers<CSS>, merge_plan: &sbwt::MergeInterleaving, removed_positions: Option<&bitvec::vec::BitVec<u64, bitvec::order::Lsb0>>, merged_sbwt: &SbwtIndex<SubsetMatrix>, merged_lcs: &LcsArray, merged_dbg: &Dbg<'_, SubsetMatrix>, sample_distance: usize, n_threads: usize) -> (bitvec::vec::BitVec, Dbg<'a, SubsetMatrix>, Dbg<'b, SubsetMatrix>) {
