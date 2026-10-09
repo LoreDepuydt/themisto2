@@ -148,7 +148,7 @@ pub fn intersect_compact_colex_kmers<CSS: ColorSetStorage + Send + Sync>(colorin
 
 #[cfg(test)]
 mod tests {
-    use crate::{coloring_interface::{ColorSetStorage, ColorSetView}, merge::tests::{assign_color_ids, build_named_coloring, gen_random_dna_string, NO_SAMPLING}};
+    use crate::{coloring_interface::{ColorSetStorage, ColorSetView}, set_operations::merge::tests::{assign_color_ids, build_named_coloring, gen_random_dna_string, NO_SAMPLING}};
 
     use super::IntersectColors;
 
