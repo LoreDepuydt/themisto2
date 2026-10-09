@@ -4,6 +4,7 @@ use sbwt::{dbg::Dbg, LcsArray, SbwtIndex, SubsetMatrix};
 use simple_sds_sbwt::ops::{BitVec, Rank, Select};
 
 use crate::set_operations::key_kmers::{mark_key_kmers_for, mark_structural_key_kmers};
+use crate::util::u64_bitvec_to_simple_sds;
 use crate::{atomic_bitmap::AtomicBitmap, colex_colored_kmers::{ColexToColorSetMap, CompactColexKmers}, coloring_interface::ColorSetStorage, parallel_ms_iteration::ElementGeneratorFromMergeInterleaving, set_of_sets_construction::{build_color_set_storage, find_kmers_that_cover_all_distinct_sets_from_generator_that_does_not_give_duplicates}};
 
 /// Maps the colex positions of the k-mers of one input index to their colex positions in the merged
@@ -31,12 +32,6 @@ impl<'a> ToMerged<'a> {
         let pos = self.in_input.select(input_colex).unwrap();
         pos - self.removed.map_or(0, |r| r.rank(pos))
     }
-}
-
-pub(crate) fn u64_bitvec_to_simple_sds(bv: &bitvec::vec::BitVec<u64, bitvec::order::Lsb0>) -> simple_sds_sbwt::bit_vector::BitVector {
-    let mut copy = bitvec::vec::BitVec::<usize, bitvec::order::Lsb0>::from_vec(bv.as_raw_slice().iter().map(|&w| w as usize).collect());
-    copy.truncate(bv.len());
-    crate::util::bitvec_to_simple_sds_bitvec(copy)
 }
 
 #[allow(clippy::too_many_arguments)]
