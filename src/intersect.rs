@@ -3,7 +3,7 @@ use std::{cmp::max, sync::Arc};
 use sbwt::{dbg::Dbg, LcsArray};
 use simple_sds_sbwt::ops::{BitVec, Rank, Select};
 
-use crate::{atomic_bitmap::AtomicBitmap, colex_colored_kmers::{ColexToColorSetMap, CompactColexKmers}, coloring_interface::ColorSetStorage, merge::{mark_key_kmers_for, mark_structural_key_kmers, u64_bitvec_to_simple_sds}, parallel_ms_iteration::{ColorCombination, ElementGeneratorFromIntersectionInterleaving}, set_of_sets_construction::{build_color_set_storage, find_kmers_that_cover_all_distinct_sets_from_generator_that_does_not_give_duplicates}};
+use crate::{atomic_bitmap::AtomicBitmap, colex_colored_kmers::{ColexToColorSetMap, CompactColexKmers}, coloring_interface::ColorSetStorage, merge::u64_bitvec_to_simple_sds, set_operations::key_kmers::{mark_key_kmers_for, mark_structural_key_kmers}, parallel_ms_iteration::{ColorCombination, ElementGeneratorFromIntersectionInterleaving}, set_of_sets_construction::{build_color_set_storage, find_kmers_that_cover_all_distinct_sets_from_generator_that_does_not_give_duplicates}};
 
 /// How the color set of a k-mer of the intersection is computed from its color sets in the two
 /// input indexes.
