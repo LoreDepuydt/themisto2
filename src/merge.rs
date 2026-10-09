@@ -1,4 +1,4 @@
-use std::{cmp::max, collections::{HashMap, HashSet}, sync::Arc};
+use std::{cmp::max, sync::Arc};
 
 use sbwt::{dbg::{Dbg, Node}, LcsArray, SbwtIndex, StreamingIndex, SubsetMatrix};
 use simple_sds_sbwt::ops::{BitVec, Rank, Select};
@@ -184,46 +184,6 @@ fn mark_new_key_kmers<'a, 'b, CSS: ColorSetStorage + Send + Sync>(coloring1: &'a
     (key_kmer_marks.into_bitvec(), dbg1, dbg2)
 }
 
-pub(crate) fn check_unique_names(names: &[String], which: &str) -> Result<(), String> {
-    let mut seen = HashSet::<&str>::with_capacity(names.len());
-    for name in names {
-        if !seen.insert(name.as_str()) {
-            return Err(format!("Color name {:?} appears more than once in the {} index. Color names must be unique to merge shared colors.", name, which));
-        }
-    }
-    Ok(())
-}
-
-/// Returns the merged color id of each color of the second coloring, and the color names of
-/// the merged coloring. The colors of the first coloring keep their ids. If merge_shared is
-/// true, a color of the second coloring with the same name as a color of the first coloring is
-/// mapped to that color. All other colors of the second coloring get new ids after the colors
-/// of the first coloring, in their original order. Returns an error if merge_shared is true and
-/// a name appears twice within one coloring.
-pub(crate) fn merged_color_mapping(names1: &[String], names2: &[String], merge_shared: bool) -> Result<(Vec<usize>, Vec<String>), String> {
-    let n1 = names1.len();
-    let mut merged_names = names1.to_vec();
-
-    if !merge_shared {
-        merged_names.extend(names2.iter().cloned());
-        return Ok(((n1..n1 + names2.len()).collect(), merged_names));
-    }
-
-    check_unique_names(names1, "first")?;
-    check_unique_names(names2, "second")?;
-
-    let name_to_id1: HashMap<&str, usize> = names1.iter().enumerate().map(|(i, name)| (name.as_str(), i)).collect();
-    let color2_to_merged: Vec<usize> = names2.iter().map(|name| {
-        name_to_id1.get(name.as_str()).copied().unwrap_or_else(|| {
-            merged_names.push(name.clone());
-            merged_names.len() - 1
-        })
-    }).collect();
-
-    log::info!("{} colors are shared between the two indexes", n1 + names2.len() - merged_names.len());
-    Ok((color2_to_merged, merged_names))
-}
-
 // If keep_redundant_dummies is true, the dummy nodes that become redundant in the SBWT merge are kept.
 // The result has the same k-mers and colors, but possibly more dummy nodes.
 pub fn merge_compact_colex_kmers<CSS: ColorSetStorage + Send + Sync>(coloring1: CompactColexKmers<CSS>, coloring2: CompactColexKmers<CSS>, merge_shared_colors: bool, optimize_peak_ram: bool, keep_redundant_dummies: bool, sample_distance: usize, n_threads: usize) -> CompactColexKmers<CSS> {
@@ -239,7 +199,7 @@ pub fn merge_compact_colex_kmers<CSS: ColorSetStorage + Send + Sync>(coloring1: 
     // for good reasons by design (read the comment at sbwt::merge for an explanation).
     let (sbwt1, lcs1, map1, sets1, color_names_1) = coloring1.into_parts();
     let (sbwt2, lcs2, map2, sets2, color_names_2) = coloring2.into_parts();
-    let (color2_to_merged, merged_color_names) = merged_color_mapping(&color_names_1, &color_names_2, merge_shared_colors).unwrap_or_else(|e| {
+    let (color2_to_merged, merged_color_names) = crate::set_operations::colors::merged_color_mapping(&color_names_1, &color_names_2, merge_shared_colors).unwrap_or_else(|e| {
         log::error!("{}", e);
         panic!("{}", e);
     });
@@ -688,27 +648,5 @@ pub(crate) mod tests {
         check_named_merge(k, &colors1, &colors2, true, 3, 3, 3);
     }
 
-    #[test]
-    fn test_merge_shared_colors_rejects_duplicate_names() {
-        let a = vec!["A".to_string(), "A".to_string()];
-        let b = vec!["B".to_string()];
-        assert!(super::merged_color_mapping(&a, &b, true).is_err());
-        assert!(super::merged_color_mapping(&b, &a, true).is_err());
-        assert!(super::merged_color_mapping(&a, &b, false).is_ok()); // Names are not matched without the flag
-    }
 
-    #[test]
-    fn test_merged_color_mapping() {
-        let to_strings = |v: &[&str]| -> Vec<String> { v.iter().map(|s| s.to_string()).collect() };
-        let names1 = to_strings(&["A", "B", "C"]);
-        let names2 = to_strings(&["D", "C", "E", "A"]);
-
-        let (map, names) = super::merged_color_mapping(&names1, &names2, true).unwrap();
-        assert_eq!(map, vec![3, 2, 4, 0]);
-        assert_eq!(names, to_strings(&["A", "B", "C", "D", "E"]));
-
-        let (map, names) = super::merged_color_mapping(&names1, &names2, false).unwrap();
-        assert_eq!(map, vec![3, 4, 5, 6]);
-        assert_eq!(names, to_strings(&["A", "B", "C", "D", "C", "E", "A"]));
-    }
 }

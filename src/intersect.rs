@@ -1,9 +1,9 @@
-use std::{cmp::max, collections::HashMap, sync::Arc};
+use std::{cmp::max, sync::Arc};
 
 use sbwt::{dbg::Dbg, LcsArray};
 use simple_sds_sbwt::ops::{BitVec, Rank, Select};
 
-use crate::{atomic_bitmap::AtomicBitmap, colex_colored_kmers::{ColexToColorSetMap, CompactColexKmers}, coloring_interface::ColorSetStorage, merge::{check_unique_names, mark_key_kmers_for, mark_structural_key_kmers, merged_color_mapping, u64_bitvec_to_simple_sds}, parallel_ms_iteration::{ColorCombination, ElementGeneratorFromIntersectionInterleaving}, set_of_sets_construction::{build_color_set_storage, find_kmers_that_cover_all_distinct_sets_from_generator_that_does_not_give_duplicates}};
+use crate::{atomic_bitmap::AtomicBitmap, colex_colored_kmers::{ColexToColorSetMap, CompactColexKmers}, coloring_interface::ColorSetStorage, merge::{mark_key_kmers_for, mark_structural_key_kmers, u64_bitvec_to_simple_sds}, parallel_ms_iteration::{ColorCombination, ElementGeneratorFromIntersectionInterleaving}, set_of_sets_construction::{build_color_set_storage, find_kmers_that_cover_all_distinct_sets_from_generator_that_does_not_give_duplicates}};
 
 /// How the color set of a k-mer of the intersection is computed from its color sets in the two
 /// input indexes.
@@ -45,31 +45,6 @@ impl<'a> ToIntersection<'a> {
     }
 }
 
-/// Returns, for the intersection of the color sets, the result color id of each color of the
-/// first and of the second coloring (None if the color is not in the result), and the color names
-/// of the result. The result has the colors whose names are in both colorings, in the order of the
-/// first coloring. Returns an error if a name appears twice within one coloring.
-#[allow(clippy::type_complexity)]
-fn intersected_color_mapping(names1: &[String], names2: &[String]) -> Result<(Vec<Option<usize>>, Vec<Option<usize>>, Vec<String>), String> {
-    check_unique_names(names1, "first")?;
-    check_unique_names(names2, "second")?;
-
-    let in_names2: std::collections::HashSet<&str> = names2.iter().map(|name| name.as_str()).collect();
-    let mut result_names = Vec::<String>::new();
-    let mut name_to_result = HashMap::<&str, usize>::new();
-    let color1_to_result: Vec<Option<usize>> = names1.iter().map(|name| {
-        in_names2.contains(name.as_str()).then(|| {
-            name_to_result.insert(name.as_str(), result_names.len());
-            result_names.push(name.clone());
-            result_names.len() - 1
-        })
-    }).collect();
-    let color2_to_result: Vec<Option<usize>> = names2.iter().map(|name| name_to_result.get(name.as_str()).copied()).collect();
-
-    log::info!("{} colors are shared between the two indexes", result_names.len());
-    Ok((color1_to_result, color2_to_result, result_names))
-}
-
 /// Intersects two colored indexes: the result has the k-mers that are in both indexes. The color
 /// set of each k-mer is the union or the intersection of its color sets in the two indexes,
 /// depending on `colors`. With the union, merge_shared_colors is as in
@@ -86,9 +61,9 @@ pub fn intersect_compact_colex_kmers<CSS: ColorSetStorage + Send + Sync>(colorin
 
     // Color mapping first, so that an error is reported before the expensive work
     let (color1_to_result, color2_to_result, result_color_names) = match colors {
-        IntersectColors::Union => merged_color_mapping(coloring1.get_color_names(), coloring2.get_color_names(), merge_shared_colors)
+        IntersectColors::Union => crate::set_operations::colors::merged_color_mapping(coloring1.get_color_names(), coloring2.get_color_names(), merge_shared_colors)
             .map(|(color2_to_merged, names)| (vec![], color2_to_merged.into_iter().map(Some).collect::<Vec<_>>(), names)),
-        IntersectColors::Intersect => intersected_color_mapping(coloring1.get_color_names(), coloring2.get_color_names()),
+        IntersectColors::Intersect => crate::set_operations::colors::intersected_color_mapping(coloring1.get_color_names(), coloring2.get_color_names()),
     }.unwrap_or_else(|e| {
         log::error!("{}", e);
         panic!("{}", e);
@@ -348,18 +323,5 @@ mod tests {
         check_all_modes(k, &colors1, &colors2, NO_SAMPLING);
     }
 
-    #[test]
-    fn test_intersected_color_mapping() {
-        let to_strings = |v: &[&str]| -> Vec<String> { v.iter().map(|s| s.to_string()).collect() };
-        let names1 = to_strings(&["A", "B", "C", "D"]);
-        let names2 = to_strings(&["D", "E", "A"]);
-        let (map1, map2, names) = super::intersected_color_mapping(&names1, &names2).unwrap();
-        assert_eq!(map1, vec![Some(0), None, None, Some(1)]);
-        assert_eq!(map2, vec![Some(1), None, Some(0)]);
-        assert_eq!(names, to_strings(&["A", "D"]));
 
-        let duplicates = to_strings(&["A", "A"]);
-        assert!(super::intersected_color_mapping(&duplicates, &names2).is_err());
-        assert!(super::intersected_color_mapping(&names2, &duplicates).is_err());
-    }
 }

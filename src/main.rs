@@ -35,6 +35,7 @@ mod finimizers;
 mod util;
 mod merge;
 mod intersect;
+mod set_operations;
 mod pseudoalignment;
 mod pseudoalignment_metrics;
 mod sparse_dense_storage_to_disk;
