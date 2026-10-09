@@ -516,18 +516,23 @@ impl<'a, CSS: ColorSetStorage + Sync + Send> ParallelElementGenerator for Elemen
 
         let is_result_kmer = |pos: usize| interleaving.s1[pos] && interleaving.s2[pos] && !interleaving.is_dummy[pos];
 
+        // The number of bits of s1 and s2 and of result k-mers in each piece, counted in parallel
+        let ranges = crate::util::segment_range(0..n, n_threads);
+        let counts: Vec<(usize, usize, usize)> = ranges.clone().into_par_iter().map(|range| {
+            (interleaving.s1[range.clone()].count_ones(), interleaving.s2[range.clone()].count_ones(), count_result_kmers(interleaving, range))
+        }).collect();
         let mut thread_inputs = Vec::<IntersectionThreadInput>::with_capacity(n_threads);
         let (mut n_bits_s1, mut n_bits_s2, mut n_result_kmers) = (0_usize, 0_usize, 0_usize);
-        for range in crate::util::segment_range(0..n, n_threads) {
+        for (range, (c1, c2, c3)) in ranges.into_iter().zip(counts) {
             thread_inputs.push(IntersectionThreadInput {
-                interleaving_range: range.clone(),
+                interleaving_range: range,
                 s1_start_rank: n_bits_s1,
                 s2_start_rank: n_bits_s2,
                 result_kmer_start_rank: n_result_kmers,
             });
-            n_bits_s1 += interleaving.s1[range.clone()].count_ones();
-            n_bits_s2 += interleaving.s2[range.clone()].count_ones();
-            n_result_kmers += range.filter(|&pos| is_result_kmer(pos)).count();
+            n_bits_s1 += c1;
+            n_bits_s2 += c2;
+            n_result_kmers += c3;
         }
         assert_eq!(n_result_kmers, self.result_kmers.count_ones());
 
@@ -555,7 +560,8 @@ impl<'a, CSS: ColorSetStorage + Sync + Send> ParallelElementGenerator for Elemen
         thread_inputs.into_par_iter().for_each(|input| {
             let mut s1_colex = input.s1_start_rank;
             let mut s2_colex = input.s2_start_rank;
-            let mut result_kmer_rank = input.result_kmer_start_rank;
+            // The colex positions of the result k-mers, in order, from the first one in this piece
+            let mut result_kmer_positions = self.result_kmers.select_iter(input.result_kmer_start_rank);
             // The shared colors of coloring1 at the current k-mer, as a bitmap for O(1) lookups
             // and as a list for clearing the bitmap afterwards. Not allocated without shared colors.
             let mut in_set1 = bitvec::bitvec![0; if has_shared_colors { self.n_result_colors } else { 0 }];
@@ -565,8 +571,7 @@ impl<'a, CSS: ColorSetStorage + Sync + Send> ParallelElementGenerator for Elemen
                     bar.inc(10000);
                 }
                 if is_result_kmer(pos) {
-                    let result_colex = self.result_kmers.select(result_kmer_rank).unwrap();
-                    result_kmer_rank += 1;
+                    let (_, result_colex) = result_kmer_positions.next().unwrap();
                     if self.result_key_kmer_marks[result_colex] {
                         if let Some(new_set_id) = maybe_apply_filter(self.filter.as_deref(), result_colex) {
                             let set1 = self.coloring1.colex_to_set(s1_colex);
@@ -619,6 +624,26 @@ impl<'a, CSS: ColorSetStorage + Sync + Send> ParallelElementGenerator for Elemen
     fn rewind(&mut self) {
         // Nothing needs to done, calling run() again already works
     }
+}
+
+/// The number of positions in `range` of the interleaving that are k-mers of the intersection: in
+/// both inputs and not dummies. Counted a word at a time.
+fn count_result_kmers(interleaving: &MergeInterleaving, range: Range<usize>) -> usize {
+    if range.is_empty() {
+        return 0;
+    }
+    let (s1, s2, is_dummy) = (interleaving.s1.as_raw_slice(), interleaving.s2.as_raw_slice(), interleaving.is_dummy.as_raw_slice());
+    let (first_word, last_word) = (range.start / 64, (range.end - 1) / 64);
+    (first_word..=last_word).map(|w| {
+        let mut word = s1[w] & s2[w] & !is_dummy[w];
+        if w == first_word {
+            word &= !0_u64 << (range.start % 64); // Only bits from range.start on
+        }
+        if w == last_word && range.end % 64 != 0 {
+            word &= (1_u64 << (range.end % 64)) - 1; // Only bits before range.end
+        }
+        word.count_ones() as usize
+    }).sum()
 }
 
 /// Returns the id of the set of the given colex position after filtering: its rank among the
@@ -744,5 +769,19 @@ mod tests {
             .expect("CGC should be in the SBWT");
         let cgc_color0 = got.iter().filter(|e| e.set_id == colex_cgc && e.color == 0).count();
         assert_eq!(cgc_color0, 2, "CGC should be reported twice for color 0 (once per strand)");
+    }
+
+    #[test]
+    fn count_result_kmers_matches_counting_bit_by_bit() {
+        use rand_chacha::rand_core::{RngCore, SeedableRng};
+        let mut rng = rand_chacha::ChaCha20Rng::seed_from_u64(1);
+        let n = 1000;
+        let mut random_bits = || -> bitvec::vec::BitVec<u64, bitvec::order::Lsb0> { (0..n).map(|_| rng.next_u64() % 3 != 0).collect() };
+        let interleaving = sbwt::MergeInterleaving { s1: random_bits(), s2: random_bits(), is_dummy: random_bits(), is_leader: random_bits() };
+        let expected = |range: std::ops::Range<usize>| range.filter(|&p| interleaving.s1[p] && interleaving.s2[p] && !interleaving.is_dummy[p]).count();
+        // Ranges within one word, across word boundaries, ending at a word boundary, and empty
+        for range in [0..0, 0..1, 3..60, 0..64, 64..128, 60..70, 1..1000, 63..65, 500..500, 999..1000, 0..1000] {
+            assert_eq!(super::count_result_kmers(&interleaving, range.clone()), expected(range.clone()), "range {:?}", range);
+        }
     }
 }

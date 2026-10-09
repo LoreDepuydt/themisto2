@@ -328,7 +328,7 @@ pub(crate) mod tests {
     use jseqio::seq_db::SeqDB;
     use rustc_hash::FxHasher;
     use sbwt::{BitPackedKmerSortingMem, LcsArray, SbwtIndex, SubsetMatrix};
-    use simple_sds_sbwt::ops::{BitVec, Rank};
+    use simple_sds_sbwt::ops::Rank;
 
     use crate::{colex_colored_kmers::{ColexToColorSetMap, mark_key_kmers}, coloring_interface::{ColorSetStorage, ColorSetView}, int_vec::CompactIntVec, io::RewindableSeqStreamGenerator, sparse_dense_storage::SparseDenseStorage, util::VecVecRewindableGen};
 

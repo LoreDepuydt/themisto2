@@ -104,6 +104,10 @@ pub fn intersect_compact_colex_kmers<CSS: ColorSetStorage + Send + Sync>(colorin
     let sbwt2 = Arc::new(sbwt2);
     let interleaving = Arc::new(interleaving);
 
+    // TODO: sbwt::intersect repairs the dummy chains of the result by building a three-way
+    // interleaving of both inputs and an auxiliary index from scratch, which takes about as long as
+    // the interleaving above and is the memory peak of the intersection. Reusing this interleaving
+    // and only interleaving the (usually small) auxiliary index into it would save most of that.
     let mut result_sbwt = sbwt::intersect(sbwt1.clone(), sbwt2.clone(), interleaving.clone(), precalc_len, optimize_peak_ram, n_threads)
         .unwrap_or_else(|_| panic!("The SBWT of the first index has no select support"));
     result_sbwt.build_select();
