@@ -32,17 +32,17 @@ impl<'a> ToMerged<'a> {
     }
 }
 
-fn u64_bitvec_to_simple_sds(bv: &bitvec::vec::BitVec<u64, bitvec::order::Lsb0>) -> simple_sds_sbwt::bit_vector::BitVector {
+pub(crate) fn u64_bitvec_to_simple_sds(bv: &bitvec::vec::BitVec<u64, bitvec::order::Lsb0>) -> simple_sds_sbwt::bit_vector::BitVector {
     let mut copy = bitvec::vec::BitVec::<usize, bitvec::order::Lsb0>::from_vec(bv.as_raw_slice().iter().map(|&w| w as usize).collect());
     copy.truncate(bv.len());
     crate::util::bitvec_to_simple_sds_bitvec(copy)
 }
 
-fn mark_kmer(colex: usize, marks: &AtomicBitmap) {
+pub(crate) fn mark_kmer(colex: usize, marks: &AtomicBitmap) {
     marks.set(colex, true);
 }
 
-fn mark_in_neighbors<'a>(colex: usize, dbg: &Dbg<'a, SubsetMatrix>, marks: &AtomicBitmap) {
+pub(crate) fn mark_in_neighbors<'a>(colex: usize, dbg: &Dbg<'a, SubsetMatrix>, marks: &AtomicBitmap) {
     let mut in_neighbor_buf = Vec::<(Node, u8)>::new(); // TODO: avoid this allocation
     dbg.push_in_neighbors(Node{id: colex}, &mut in_neighbor_buf);
     for (in_node, _) in in_neighbor_buf.iter() {
@@ -50,8 +50,12 @@ fn mark_in_neighbors<'a>(colex: usize, dbg: &Dbg<'a, SubsetMatrix>, marks: &Atom
     }
 }
 
+/// Marks the key k-mers of the merged (or otherwise combined) index that the colored subunitigs of
+/// `coloring` require: the last k-mer of each colored subunitig, and the in-neighbors in the merged
+/// DBG of the first k-mer of each colored subunitig. `to_merged` maps a colex position of
+/// `coloring` to its colex position in the merged index, or None if the k-mer is not there.
 #[allow(clippy::too_many_arguments)]
-fn mark_key_kmers_for<'a, CSS: ColorSetStorage + Send + Sync>(coloring: &'a CompactColexKmers<CSS>, to_merged: &ToMerged, merged_sbwt: &SbwtIndex<SubsetMatrix>, merged_lcs: &LcsArray, merged_dbg: &Dbg<'_, SubsetMatrix>, key_kmer_marks: &AtomicBitmap, visited_marks: Option<&AtomicBitmap>, n_threads: usize) -> Dbg<'a, SubsetMatrix> {
+pub(crate) fn mark_key_kmers_for<'a, CSS: ColorSetStorage + Send + Sync>(coloring: &'a CompactColexKmers<CSS>, to_merged: impl Fn(usize) -> Option<usize> + Sync, merged_sbwt: &SbwtIndex<SubsetMatrix>, merged_lcs: &LcsArray, merged_dbg: &Dbg<'_, SubsetMatrix>, key_kmer_marks: &AtomicBitmap, visited_marks: Option<&AtomicBitmap>, n_threads: usize) -> Dbg<'a, SubsetMatrix> {
 
     let merged_si = StreamingIndex::new(merged_sbwt, merged_lcs);
 
@@ -77,8 +81,12 @@ fn mark_key_kmers_for<'a, CSS: ColorSetStorage + Send + Sync>(coloring: &'a Comp
             // The k-mer at position j of the unitig is node j. Its position in the merged index
             // comes from the merge interleaving, so neither the unitig string nor a search in
             // the merged index is needed.
-            mark_kmer(to_merged.merged_colex(nodes[e-1].id), key_kmer_marks);
-            mark_in_neighbors(to_merged.merged_colex(nodes[s].id), merged_dbg, key_kmer_marks);
+            if let Some(last) = to_merged(nodes[e-1].id) {
+                mark_kmer(last, key_kmer_marks);
+            }
+            if let Some(first) = to_merged(nodes[s].id) {
+                mark_in_neighbors(first, merged_dbg, key_kmer_marks);
+            }
         }
 
         // Debug-only coverage check: record every k-mer of this unitig as visited, so
@@ -120,19 +128,14 @@ fn mark_key_kmers_for<'a, CSS: ColorSetStorage + Send + Sync>(coloring: &'a Comp
     dbg
 }
 
-#[allow(clippy::too_many_arguments)]
-fn mark_new_key_kmers<'a, 'b, CSS: ColorSetStorage + Send + Sync>(coloring1: &'a CompactColexKmers<CSS>, coloring2: &'b CompactColexKmers<CSS>, merge_plan: &sbwt::MergeInterleaving, removed_positions: Option<&bitvec::vec::BitVec<u64, bitvec::order::Lsb0>>, merged_sbwt: &SbwtIndex<SubsetMatrix>, merged_lcs: &LcsArray, merged_dbg: &Dbg<'_, SubsetMatrix>, sample_distance: usize, n_threads: usize) -> (bitvec::vec::BitVec, Dbg<'a, SubsetMatrix>, Dbg<'b, SubsetMatrix>) {
-    let k = merged_sbwt.k();
-    assert_eq!(k, coloring1.get_k());
-    assert_eq!(k, coloring2.get_k());
-
-    let key_kmer_marks = AtomicBitmap::new(merged_sbwt.n_sets());
-
-    // Mark kmers around branches in the DBG. This part is independent of coloring
-    let bar = indicatif::ProgressBar::new(merged_sbwt.n_kmers() as u64);
-    merged_dbg.iter_unitigs_with_callback(|nodes|{
-        mark_in_neighbors(nodes.first().unwrap().id, merged_dbg, &key_kmer_marks);
-        mark_kmer(nodes.last().unwrap().id, &key_kmer_marks);
+/// Marks the key k-mers around branches of the DBG (the last k-mer of each unitig and the
+/// in-neighbors of its first k-mer), and samples every sample_distance-th k-mer of each unitig.
+/// This part is independent of coloring.
+pub(crate) fn mark_structural_key_kmers(sbwt: &SbwtIndex<SubsetMatrix>, dbg: &Dbg<'_, SubsetMatrix>, key_kmer_marks: &AtomicBitmap, sample_distance: usize, n_threads: usize) {
+    let bar = indicatif::ProgressBar::new(sbwt.n_kmers() as u64);
+    dbg.iter_unitigs_with_callback(|nodes|{
+        mark_in_neighbors(nodes.first().unwrap().id, dbg, key_kmer_marks);
+        mark_kmer(nodes.last().unwrap().id, key_kmer_marks);
 
         for v in nodes.iter().rev().step_by(sample_distance) {
             key_kmer_marks.set(v.id,  true);
@@ -140,7 +143,17 @@ fn mark_new_key_kmers<'a, 'b, CSS: ColorSetStorage + Send + Sync>(coloring1: &'a
         bar.inc(nodes.len() as u64);
     }, n_threads);
     bar.finish();
-    
+}
+
+#[allow(clippy::too_many_arguments)]
+fn mark_new_key_kmers<'a, 'b, CSS: ColorSetStorage + Send + Sync>(coloring1: &'a CompactColexKmers<CSS>, coloring2: &'b CompactColexKmers<CSS>, merge_plan: &sbwt::MergeInterleaving, removed_positions: Option<&bitvec::vec::BitVec<u64, bitvec::order::Lsb0>>, merged_sbwt: &SbwtIndex<SubsetMatrix>, merged_lcs: &LcsArray, merged_dbg: &Dbg<'_, SubsetMatrix>, sample_distance: usize, n_threads: usize) -> (bitvec::vec::BitVec, Dbg<'a, SubsetMatrix>, Dbg<'b, SubsetMatrix>) {
+    let k = merged_sbwt.k();
+    assert_eq!(k, coloring1.get_k());
+    assert_eq!(k, coloring2.get_k());
+
+    let key_kmer_marks = AtomicBitmap::new(merged_sbwt.n_sets());
+    mark_structural_key_kmers(merged_sbwt, merged_dbg, &key_kmer_marks, sample_distance, n_threads);
+
     // Debug-only sanity check that every merged k-mer gets visited while processing coloring1
     // or coloring2 (see the coverage check in mark_key_kmers_for). Skipped in release builds:
     // it costs a full extra streaming-index pass over the merged graph and is not needed for
@@ -156,11 +169,11 @@ fn mark_new_key_kmers<'a, 'b, CSS: ColorSetStorage + Send + Sync>(coloring1: &'a
     });
     let dbg1 = {
         let to_merged = ToMerged::new(&merge_plan.s1, removed.as_ref());
-        mark_key_kmers_for(coloring1, &to_merged, merged_sbwt, merged_lcs, merged_dbg, &key_kmer_marks, visited_marks.as_ref(), n_threads)
+        mark_key_kmers_for(coloring1, |colex| Some(to_merged.merged_colex(colex)), merged_sbwt, merged_lcs, merged_dbg, &key_kmer_marks, visited_marks.as_ref(), n_threads)
     };
     let dbg2 = {
         let to_merged = ToMerged::new(&merge_plan.s2, removed.as_ref());
-        mark_key_kmers_for(coloring2, &to_merged, merged_sbwt, merged_lcs, merged_dbg, &key_kmer_marks, visited_marks.as_ref(), n_threads)
+        mark_key_kmers_for(coloring2, |colex| Some(to_merged.merged_colex(colex)), merged_sbwt, merged_lcs, merged_dbg, &key_kmer_marks, visited_marks.as_ref(), n_threads)
     };
     drop(removed);
 
@@ -171,7 +184,7 @@ fn mark_new_key_kmers<'a, 'b, CSS: ColorSetStorage + Send + Sync>(coloring1: &'a
     (key_kmer_marks.into_bitvec(), dbg1, dbg2)
 }
 
-fn check_unique_names(names: &[String], which: &str) -> Result<(), String> {
+pub(crate) fn check_unique_names(names: &[String], which: &str) -> Result<(), String> {
     let mut seen = HashSet::<&str>::with_capacity(names.len());
     for name in names {
         if !seen.insert(name.as_str()) {
@@ -187,7 +200,7 @@ fn check_unique_names(names: &[String], which: &str) -> Result<(), String> {
 /// mapped to that color. All other colors of the second coloring get new ids after the colors
 /// of the first coloring, in their original order. Returns an error if merge_shared is true and
 /// a name appears twice within one coloring.
-fn merged_color_mapping(names1: &[String], names2: &[String], merge_shared: bool) -> Result<(Vec<usize>, Vec<String>), String> {
+pub(crate) fn merged_color_mapping(names1: &[String], names2: &[String], merge_shared: bool) -> Result<(Vec<usize>, Vec<String>), String> {
     let n1 = names1.len();
     let mut merged_names = names1.to_vec();
 
@@ -309,7 +322,7 @@ pub fn merge_compact_colex_kmers<CSS: ColorSetStorage + Send + Sync>(coloring1: 
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::{collections::HashMap, hash::BuildHasherDefault};
 
     use jseqio::seq_db::SeqDB;
@@ -328,7 +341,7 @@ mod tests {
     // The sample distances in the tests below are larger than any unitig, so that
     // only the structurally required key k-mers get marked. Any k-mer that the
     // merge forgets to mark then results in a wrong color set.
-    const NO_SAMPLING: usize = 1000;
+    pub(crate) const NO_SAMPLING: usize = 1000;
 
     // Annoying plumbing to get a RewindableSeqStreamGenerator from Vec<SeqDB>
     /*
@@ -424,7 +437,7 @@ mod tests {
     /// Turns (color name, sequence) pairs into (color id, sequence) pairs, where the color id
     /// is the index of the name in `names`. Names that are not yet in `names` are appended, so
     /// a name that appears several times is one color with several sequences.
-    fn assign_color_ids(names: &mut Vec<String>, colors: &[(&str, Vec<u8>)]) -> Vec<(usize, Vec<u8>)> {
+    pub(crate) fn assign_color_ids(names: &mut Vec<String>, colors: &[(&str, Vec<u8>)]) -> Vec<(usize, Vec<u8>)> {
         colors.iter().map(|(name, seq)| {
             let color = names.iter().position(|x| x == name).unwrap_or_else(|| {
                 names.push(name.to_string());
@@ -448,7 +461,7 @@ mod tests {
 
     /// Builds a CompactColexKmers where color i is named names[i] and consists of the sequences
     /// s with (i, s) in seqs.
-    fn build_named_coloring(k: usize, names: &[String], seqs: &[(usize, Vec<u8>)], sample_distance: usize, n_threads: usize) -> CompactColexKmers<SparseDenseStorage> {
+    pub(crate) fn build_named_coloring(k: usize, names: &[String], seqs: &[(usize, Vec<u8>)], sample_distance: usize, n_threads: usize) -> CompactColexKmers<SparseDenseStorage> {
         let mut dbs: Vec<SeqDB> = names.iter().map(|_| SeqDB::new()).collect();
         for (color, seq) in seqs {
             dbs[*color].push_seq(seq);

@@ -34,6 +34,7 @@ mod int_vec;
 mod finimizers;
 mod util;
 mod merge;
+mod intersect;
 mod pseudoalignment;
 mod pseudoalignment_metrics;
 mod sparse_dense_storage_to_disk;
@@ -249,6 +250,33 @@ pub enum Subcommands {
 
         #[arg(long = "keep-redundant-dummies", help = "Do not remove the dummy nodes that become redundant when merging SBWTs. The result has the same k-mers and colors, but may have more dummy nodes.")]
         keep_redundant_dummies: bool,
+    },
+
+    #[command(arg_required_else_help = true, name = "intersect", about = "Intersect two indexes: keep the k-mers that are in both")]
+    Intersect {
+        #[arg(long = "index1", required = true)]
+        index1: PathBuf,
+
+        #[arg(long = "index2", required = true)]
+        index2: PathBuf,
+
+        #[arg(long = "output", short = 'o', required = true)]
+        outfile: PathBuf,
+
+        #[arg(long = "colors", value_enum, default_value = "union", help = "How the color set of each k-mer is computed from its color sets in the two indexes. With 'intersect', colors are matched by name, only the colors in both indexes are kept, and k-mers whose color sets do not intersect get an empty color set. Color names must be unique within each input index.")]
+        colors: intersect::IntersectColors,
+
+        #[arg(long = "merge-shared-colors", help = "With '--colors union': treat colors with identical names in the two indexes as the same color. Color names must be unique within each input index.")]
+        merge_shared_colors: bool,
+
+        #[arg(long = "sample-distance", short = 'd', default_value = "30")]
+        sample_distance: usize,
+
+        #[arg(long = "n-threads", short = 't', default_value = "4")]
+        n_threads: usize,
+
+        #[arg(long = "low-ram-mode", help = "Use more slower but more compact algorithm invert and intersect SBWTs")]
+        low_ram_mode: bool,
     },
 
     #[command(arg_required_else_help = true)]
@@ -1191,6 +1219,22 @@ fn main() -> std::process::ExitCode {
         Subcommands::Merge { index_file_list, temp_dir, outfile, n_threads, low_ram_mode, merge_shared_colors, keep_redundant_dummies, sample_distance } => {
             let infiles: Vec<PathBuf> = BufReader::new(File::open(index_file_list).unwrap()).lines().map(|f| PathBuf::from(f.unwrap())).collect();
             run_merge_tree(&infiles, &temp_dir, &outfile, n_threads, merge_shared_colors, low_ram_mode, keep_redundant_dummies, sample_distance);
+        },
+        Subcommands::Intersect { index1, index2, outfile, colors, merge_shared_colors, sample_distance, n_threads, low_ram_mode } => {
+            if merge_shared_colors && colors != intersect::IntersectColors::Union {
+                log::warn!("--merge-shared-colors has no effect with --colors {:?}: colors are always matched by name", colors);
+            }
+            let mut out = BufWriter::new(File::create(&outfile).unwrap());
+            let colors1 = load_index_variant(&index1, true); // Select support is required
+            let colors2 = load_index_variant(&index2, true); // Select support is required
+            match (colors1, colors2) {
+                (IndexVariant::SparseDenseIndex(c1), IndexVariant::SparseDenseIndex(c2)) => {
+                    log::info!("Intersecting {} and {}", index1.display(), index2.display());
+                    let result = intersect::intersect_compact_colex_kmers(c1, c2, colors, merge_shared_colors, low_ram_mode, sample_distance, n_threads);
+                    log::info!("Serializing intersection to {}", outfile.display());
+                    write_index_variant(&IndexVariant::SparseDenseIndex(result), &mut out);
+                },
+            }
         },
         Subcommands::Import { sbwt_path, lcs_path, color_dump_prefix, out: out_path, n_threads, temp_dir, sample_distance} => {
             let unitig_filename = format!("{}.unitigs.fa", color_dump_prefix.to_str().unwrap());

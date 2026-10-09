@@ -2,7 +2,7 @@ use std::{collections::HashSet, ops::Range, sync::Arc};
 
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use sbwt::{LcsArray, MergeInterleaving, SbwtIndex, SeqStream, StreamingIndex, SubsetMatrix, reverse_complement_in_place};
-use simple_sds_sbwt::ops::{BitVec, Rank};
+use simple_sds_sbwt::ops::{BitVec, Rank, Select};
 
 use crate::{colex_colored_kmers::CompactColexKmers, coloring_interface::{ColorSetStorage, ColorSetView}, io::{self, RewindableSeqStreamGenerator}, set_of_sets_construction::{ParallelElementGenerator, SetElement}};
 
@@ -363,22 +363,6 @@ struct ThreadInput {
     s2_start_rank: usize,
 } 
 
-impl<'a, CSS: ColorSetStorage + Sync + Send> ElementGeneratorFromMergeInterleaving<'a, CSS> {
-    fn maybe_apply_filter(&self, merged_colex: usize) -> Option<usize> {
-        if let Some(filter) = &self.filter {
-            if !filter.get(merged_colex) {
-                None // Do not report this
-            } else {
-                // Assign new id
-                let new_id = filter.rank(merged_colex);
-                Some(new_id)
-            }
-        } else {
-            Some(merged_colex) // No filter
-        }
-    }
-}
-
 impl<'a, CSS: ColorSetStorage + Sync + Send> ParallelElementGenerator for ElementGeneratorFromMergeInterleaving<'a, CSS> {
 
 
@@ -437,7 +421,7 @@ impl<'a, CSS: ColorSetStorage + Sync + Send> ParallelElementGenerator for Elemen
                 }
                 let is_removed = removed.is_some_and(|r| r[pos]);
                 if !is_removed && self.merged_key_kmer_marks[merged_colex] {
-                    if let Some(new_set_id) = self.maybe_apply_filter(merged_colex) {
+                    if let Some(new_set_id) = maybe_apply_filter(self.filter.as_deref(), merged_colex) {
                         let in_1 = self.interleaving.s1[pos];
                         let in_2 = self.interleaving.s2[pos];
                         // A shared color may be in both sets. It must be reported only once.
@@ -482,6 +466,169 @@ impl<'a, CSS: ColorSetStorage + Sync + Send> ParallelElementGenerator for Elemen
 
     fn rewind(&mut self) {
         // Nothing needs to done, calling run() again already works
+    }
+}
+
+/// How the color sets of a k-mer in the two input indexes are combined into its color set in the
+/// intersection of the indexes.
+#[derive(Clone, Copy)]
+pub enum ColorCombination<'a> {
+    /// The union of the two sets. Maps each color of coloring2 to its color id in the result, as
+    /// color2_to_merged in ElementGeneratorFromMergeInterleaving: the colors of coloring1 keep
+    /// their ids, and ids smaller than the number of colors of coloring1 are shared colors.
+    Union { color2_to_result: &'a [usize] },
+    /// The intersection of the two sets. Maps each color of coloring1 and coloring2 to its color
+    /// id in the result, or to None if the color is not in the result.
+    Intersection { color1_to_result: &'a [Option<usize>], color2_to_result: &'a [Option<usize>] },
+}
+
+/// Generates the color set elements of the key k-mers of the intersection of the SBWTs of
+/// coloring1 and coloring2, computed with the given interleaving.
+pub struct ElementGeneratorFromIntersectionInterleaving<'a, CSS: ColorSetStorage + Sync + Send> {
+    pub interleaving: &'a MergeInterleaving,
+    pub coloring1: &'a CompactColexKmers<CSS>,
+    pub coloring2: &'a CompactColexKmers<CSS>,
+    // Marks the colex positions of the result SBWT that are k-mers, with select support. The
+    // intersection can add and remove dummy nodes, but the k-mers are those of the interleaving
+    // positions in both inputs that are not dummies, in the same order, so the j-th such position
+    // is the result k-mer at select(j).
+    pub result_kmers: &'a simple_sds_sbwt::bit_vector::BitVector,
+    pub result_key_kmer_marks: &'a bitvec::vec::BitVec, // Only reporting set elements for these
+    pub filter: Option<Arc<simple_sds_sbwt::bit_vector::BitVector>>, // With rank support
+    pub colors: ColorCombination<'a>,
+    pub n_result_colors: usize,
+}
+
+struct IntersectionThreadInput {
+    interleaving_range: Range<usize>,
+    s1_start_rank: usize,
+    s2_start_rank: usize,
+    result_kmer_start_rank: usize,
+}
+
+impl<'a, CSS: ColorSetStorage + Sync + Send> ParallelElementGenerator for ElementGeneratorFromIntersectionInterleaving<'a, CSS> {
+
+    fn run(&mut self, callback: impl Fn(SetElement) + Send + Sync, n_threads: usize) {
+        let interleaving = self.interleaving;
+        assert!(interleaving.s1.len() == interleaving.s2.len());
+        let n = interleaving.s1.len();
+        assert_eq!(self.result_key_kmer_marks.len(), self.result_kmers.len());
+
+        let is_result_kmer = |pos: usize| interleaving.s1[pos] && interleaving.s2[pos] && !interleaving.is_dummy[pos];
+
+        let mut thread_inputs = Vec::<IntersectionThreadInput>::with_capacity(n_threads);
+        let (mut n_bits_s1, mut n_bits_s2, mut n_result_kmers) = (0_usize, 0_usize, 0_usize);
+        for range in crate::util::segment_range(0..n, n_threads) {
+            thread_inputs.push(IntersectionThreadInput {
+                interleaving_range: range.clone(),
+                s1_start_rank: n_bits_s1,
+                s2_start_rank: n_bits_s2,
+                result_kmer_start_rank: n_result_kmers,
+            });
+            n_bits_s1 += interleaving.s1[range.clone()].count_ones();
+            n_bits_s2 += interleaving.s2[range.clone()].count_ones();
+            n_result_kmers += range.filter(|&pos| is_result_kmer(pos)).count();
+        }
+        assert_eq!(n_result_kmers, self.result_kmers.count_ones());
+
+        let n_colors1 = self.coloring1.get_set_storage().n_colors();
+        let n_colors2 = self.coloring2.get_set_storage().n_colors();
+        // The colors of the result that come from coloring1 and may also come from coloring2, so
+        // that they must be reported only once (union) or only if they come from both (intersection).
+        let mut is_shared = bitvec::bitvec![0; self.n_result_colors];
+        match self.colors {
+            ColorCombination::Union { color2_to_result } => {
+                assert_eq!(color2_to_result.len(), n_colors2);
+                for &color in color2_to_result.iter().filter(|&&c| c < n_colors1) {
+                    is_shared.set(color, true);
+                }
+            },
+            ColorCombination::Intersection { color1_to_result, color2_to_result } => {
+                assert_eq!(color1_to_result.len(), n_colors1);
+                assert_eq!(color2_to_result.len(), n_colors2);
+                is_shared.fill(true);
+            },
+        }
+        let has_shared_colors = is_shared.any();
+
+        let bar = indicatif::ProgressBar::new(n as u64);
+        thread_inputs.into_par_iter().for_each(|input| {
+            let mut s1_colex = input.s1_start_rank;
+            let mut s2_colex = input.s2_start_rank;
+            let mut result_kmer_rank = input.result_kmer_start_rank;
+            // The shared colors of coloring1 at the current k-mer, as a bitmap for O(1) lookups
+            // and as a list for clearing the bitmap afterwards. Not allocated without shared colors.
+            let mut in_set1 = bitvec::bitvec![0; if has_shared_colors { self.n_result_colors } else { 0 }];
+            let mut in_set1_list = Vec::<usize>::new();
+            for pos in input.interleaving_range {
+                if pos > 0 && pos % 10000 == 0 {
+                    bar.inc(10000);
+                }
+                if is_result_kmer(pos) {
+                    let result_colex = self.result_kmers.select(result_kmer_rank).unwrap();
+                    result_kmer_rank += 1;
+                    if self.result_key_kmer_marks[result_colex] {
+                        if let Some(new_set_id) = maybe_apply_filter(self.filter.as_deref(), result_colex) {
+                            let set1 = self.coloring1.colex_to_set(s1_colex);
+                            let set2 = self.coloring2.colex_to_set(s2_colex);
+                            match self.colors {
+                                ColorCombination::Union { color2_to_result } => {
+                                    for color in set1.iter() {
+                                        callback(SetElement{set_id: new_set_id, color});
+                                        if has_shared_colors && is_shared[color] {
+                                            in_set1.set(color, true);
+                                            in_set1_list.push(color);
+                                        }
+                                    }
+                                    for color in set2.iter() {
+                                        let color = color2_to_result[color];
+                                        if !(color < n_colors1 && has_shared_colors && in_set1[color]) {
+                                            callback(SetElement{set_id: new_set_id, color});
+                                        } // Else already reported from coloring1
+                                    }
+                                },
+                                ColorCombination::Intersection { color1_to_result, color2_to_result } => {
+                                    for color in set1.iter().filter_map(|c| color1_to_result[c]) {
+                                        in_set1.set(color, true);
+                                        in_set1_list.push(color);
+                                    }
+                                    for color in set2.iter().filter_map(|c| color2_to_result[c]) {
+                                        if in_set1[color] {
+                                            callback(SetElement{set_id: new_set_id, color});
+                                        }
+                                    }
+                                },
+                            }
+                            for color in in_set1_list.drain(..) {
+                                in_set1.set(color, false);
+                            }
+                        }
+                    }
+                }
+                s1_colex += interleaving.s1[pos] as usize;
+                s2_colex += interleaving.s2[pos] as usize;
+            }
+        });
+        bar.finish();
+    }
+
+    fn set_filter(&mut self, filter: Arc<simple_sds_sbwt::bit_vector::BitVector>) {
+        self.filter = Some(filter.clone());
+    }
+
+    fn rewind(&mut self) {
+        // Nothing needs to done, calling run() again already works
+    }
+}
+
+/// Returns the id of the set of the given colex position after filtering: its rank among the
+/// positions marked in the filter, or None if it is not marked. Without a filter, the colex
+/// position itself.
+fn maybe_apply_filter(filter: Option<&simple_sds_sbwt::bit_vector::BitVector>, colex: usize) -> Option<usize> {
+    match filter {
+        Some(filter) if !filter.get(colex) => None, // Do not report this
+        Some(filter) => Some(filter.rank(colex)), // Assign new id
+        None => Some(colex), // No filter
     }
 }
 
